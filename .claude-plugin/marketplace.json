@@ -1,0 +1,17 @@
+{
+  "name": "indie-app-skills",
+  "owner": {
+    "name": "James Krupnik",
+    "url": "https://github.com/jameskrupnik"
+  },
+  "metadata": {
+    "description": "Skills for shipping small Flutter apps to the App Store and Google Play."
+  },
+  "plugins": [
+    {
+      "name": "indie-app-skills",
+      "source": "./",
+      "description": "Claude Code skills for shipping small Flutter apps: store-rejection checks, Google Play releases, performance, polish, niche research, and keeping CLAUDE.md under its size limit."
+    }
+  ]
+}
