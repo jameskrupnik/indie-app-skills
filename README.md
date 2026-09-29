@@ -15,15 +15,17 @@ seemed obviously true.
 |---|---|---|
 | `app-similarity` | Measures how much an app shares with its sibling apps across source, store metadata, screenshots and bundled assets, before Apple's guideline 4.3 (spam) does. | `check_similarity.py` |
 | `listing-accuracy` | Checks that the store listing and App Review notes describe the app that actually exists (guideline 2.3). | `check_listing.py` |
-| `play-release` | Gets an Android app onto Google Play: the order the declarations must be done in, the EEA consent gap, and which steps a human has to do. | `preflight.sh`, `handoff.sh` |
+| `play-release` | Gets a Flutter app onto Google Play: the order the declarations must be done in, a preflight of the signed `.aab` and store listing, the EEA consent gap, and which steps a human has to do. | `preflight.sh`, `handoff.sh` |
 | `perf` | Finds work repeated every frame in `render`, `paint` and `update` methods, and benchmarks a fix without being fooled by thermal throttling. | `check_perf.py`, `paired_bench.py`, `frame_probe.dart` |
 | `polish` | Finds the layout, accessibility and Reduce Motion faults that make an app feel unfinished. | `check_polish.py` |
-| `niche-scout` | Measures an app idea against the free iTunes Search API and kills the dead ones before any code is written. | `sweep.py` |
-| `claude-md-trim` | Brings a CLAUDE.md back under Claude Code's 150,000-character limit by moving evidence into `docs/` without losing a rule. | `check_size.py` |
+| `niche-scout` | Measures an app idea against the free iTunes Search API and kills the dead ones before any code is written. App Store only. | `sweep.py` |
+| `claude-md-trim` | Brings CLAUDE.md, AGENTS.md and their imports back under Claude Code's size warning by moving evidence into `docs/` without losing a rule, then checks every link still resolves. | `check_size.py` |
 
-The scripts are plain Python 3 and POSIX shell with no dependencies. The
-skills assume a Flutter project that keeps its store copy under
-`fastlane/metadata`. `claude-md-trim` and `niche-scout` work for any project.
+The scripts need only Python 3.9+ and bash; no packages to install. Every one
+answers `--help`, and those that check a project take `--json` for hooks and CI.
+The store skills assume a Flutter project that keeps its listing under
+`fastlane/metadata` (the per-platform `ios/fastlane` and `android/fastlane`
+layouts are found too). `claude-md-trim` and `niche-scout` work for any project.
 
 ## Install
 
@@ -47,7 +49,8 @@ run any script directly, for example
 
 ## Notes
 
-- `play-release/handoff.sh` is macOS-only. It opens Finder and Google Chrome.
+- `play-release/handoff.sh` is macOS-only. It opens Finder and your browser;
+  `--dry-run` prints what it would open.
 - Everything the scripts print is a finding to check, not a verdict. Each
   SKILL.md says what its script cannot see.
 - The checks do not help you hide similarity from a reviewer.

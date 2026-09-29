@@ -1,182 +1,180 @@
 ---
 name: perf
-description: Find and fix work that repeats every frame — the cost that a green suite and a clean analyze never mention. Use when asked to profile or improve performance, to make an app or game faster or smoother, to reduce jank, stutter, dropped frames, battery drain or heat; when something "feels laggy" or "chugs" on an older phone; when reviewing a render, paint or update method; or before shipping a game that draws its own canvas. Also use when asked whether an optimization actually helped, or to benchmark two versions of anything.
+description: Find and fix work that repeats every frame in a Flutter app or game (Flame, CustomPainter, custom canvas) — the cost a green suite and a clean analyze never mention — and measure the fix honestly. Use when asked to profile or improve performance, make an app or game faster or smoother, or reduce jank, stutter, dropped frames, battery drain or heat; when something "feels laggy" or "chugs" on an older phone; when reviewing a render, paint or update method; before shipping a game that draws its own canvas; or when asked whether an optimization actually helped, or to benchmark two versions of anything.
 ---
 
 # Frame cost
 
-**A frame has 16.6ms and no test measures how much of it you are using.**
-Everything in this file ships in an app that is green, clean, and not visibly
-dropping frames — because none of it is a bug. It is work repeated sixty times
-a second that only needed doing once.
+**A frame has 16.6ms, and no test measures how much of it you are using.**
+Everything here ships in apps that are green, clean, and not visibly dropping
+frames, because none of it is a bug. It is work repeated sixty times a second
+that only needed doing once.
 
-That is the shape: **an allocation or a computation whose scope is wrong.** A
-`Paint`, a shader, a text layout, a blur — each unremarkable in a `build` that
-runs when state changes, each a per-frame cost in a `render(Canvas)`. The code
-reads identically in both places.
+The shape is always the same: **an allocation or computation whose scope is
+wrong.** A `Paint`, a shader, a text layout, a blur is unremarkable in a
+`build` that runs when state changes, and a per-frame cost in a
+`render(Canvas)`. The code reads identically in both places.
 
-## Run it
-
-```bash
-python3 ${CLAUDE_SKILL_DIR}/check_perf.py --app DIR
-```
-
-`--quiet` hides notes, `--json` for a hook, `--strict` to exit non-zero. It
-finds the per-frame methods first and only reports what is inside them,
-following private helpers one and two levels down — because the blur is
-usually not in `render`, it is in the `_drawGlow` that `render` calls.
-
-It understands the memo idiom (`_field ??= …`, a null-check-then-store, a
-`putIfAbsent`), so it will not report the fix back to you as a fault.
-
-Everything it prints is a **hypothesis**. Measure before believing it.
-
-## Measure, and measure honestly
-
-Two harnesses, both bundled:
+## Quick start
 
 ```bash
-cp ${CLAUDE_SKILL_DIR}/frame_probe.dart tool/tuning/perf_probe.dart   # adapt the marked lines
-flutter test tool/tuning/perf_probe.dart
+python3 ${CLAUDE_SKILL_DIR}/check_perf.py --app .
 ```
 
-It times `update`, **recording** a frame, and rasterizing one. Recording is the
-number to watch: `endRecording` does no GPU work, so it isolates the Dart-side
-cost, which runs on the UI thread, which is where jank comes from. The raster
-column runs Skia's *software* path — comparable between runs on your machine,
-**not** comparable to a device, and it prices blurs and mipmaps quite
+`--quiet` hides NOTEs, `--json` for a hook, `--strict` exits 1 on any
+finding, `--help` lists the checks.
+
+It finds per-frame methods first (`render(Canvas)`, `update(double)`,
+`paint(Canvas, Size)`) and reports only what is inside them, following
+private helpers in the same file two levels down, because the blur is usually
+in the `_drawGlow` that `render` calls. It recognises the memo idiom
+(`??=`, `putIfAbsent`, a null-check-then-store) so it does not report the fix
+back to you as the fault.
+
+A `CustomPainter` only runs per frame while something repaints it. One wired
+to an animation (`super(repaint: ...)`) counts as per-frame; any other
+painter's findings are reported one level lower and tagged `repaint`.
+
+**Everything it prints is a hypothesis.** Measure before believing it.
+
+### Measure, and measure honestly
+
+```bash
+cp ${CLAUDE_SKILL_DIR}/frame_probe.dart tool/perf_probe.dart  # edit the ADAPT lines
+flutter test tool/perf_probe.dart
+```
+
+The probe times `update`, **recording** a frame, and rasterizing one.
+Recording is the number to watch: `endRecording` does no GPU work, so it
+isolates the Dart-side cost on the UI thread, which is where jank comes from.
+The raster column is Skia's software path: comparable between runs on one
+machine, **not** comparable to a device, and it prices blurs and mipmaps
 differently from a GPU.
 
-### The first level measured is the compiler
-
 **Throw away the first level, and the first frames of every level.** The
-bundled probe does both. Without it, the first level reads a 33ms max and a
-p95 three times its later self — on a game whose honest worst frame was
-1.5ms — and the max column reports a hitch no player ever sees. A 120-frame
-skip alone was not enough; whichever level went first still read about 1.5x.
-**Check any existing probe for this before trusting its max column.**
+first thing measured is the JIT, not the game. Counted in, it read a 33ms max
+and a p95 three times the steady state on a game whose honest worst frame was
+1.5ms. A 120-frame skip alone was not enough: whichever level ran first still
+read about 1.5x. The bundled probe does both; check any existing probe for
+this before trusting its max column.
 
-**And even after warm-up, the max is one frame, and a garbage-collection
-pause lands there.** One game's warm probe read a rung's worst frame as
-2.2ms, then 49ms on the very next run with nothing changed, while p50 and p95
-held to within noise. Believe a max only when it repeats across runs; a
-per-frame cost moves the p95, and a GC pause does not.
+**The max is one frame, and a GC pause lands there.** A warm probe read one
+level's worst frame as 2.2ms, then 49ms on the next run with nothing changed,
+while p50 and p95 held within noise. Believe a max only when it repeats. A
+per-frame cost moves the p95; a GC pause does not.
 
-### The trap that costs an afternoon
+### Never compare N runs of A against N runs of B
 
-**Never compare five runs of one arm against five of the other.** A laptop
-throttles under sustained benchmarking, so whichever arm goes second loses —
-and by more than most optimizations win. On a real run this reported every
-metric doubling, `update` included, against a change that touched no
-simulation code at all. The conclusion was exactly backwards.
+A laptop throttles under sustained benchmarking, so whichever arm runs second
+loses, often by more than the optimization wins. Run that way, one change
+appeared to double every metric, including `update`, which it did not touch.
+The conclusion was exactly backwards.
 
 Alternate the arms and take the median of the **per-pair** ratio:
 
 ```bash
 python3 ${CLAUDE_SKILL_DIR}/paired_bench.py \
-  --probe 'flutter test tool/tuning/perf_probe.dart' \
+  --probe 'flutter test tool/perf_probe.dart' \
   --swap  './bench_swap.sh {arm}' \
   --pairs 4 --control update
 ```
 
-**Always keep a control** — a metric the change cannot possibly affect. Read it
-first. If it does not come back near 1.00x the machine drifted, and every other
-number in the table is noise wearing a decimal point. Correcting by the control
-recovers a usable estimate; the tool prints that column for you.
+`bench_swap.sh` copies the saved `before` or `after` version of each changed
+file into place. The order flips every pair, so a steady drift cancels.
 
-`bench_swap.sh` is three lines: copy the two versions of each changed file out
-to `/tmp` once, then `cp` the right one back per arm.
+**Always keep a control**: a metric the change cannot affect. Read it first.
+If it is not near 1.00x the machine drifted and the raw column is noise; the
+`corrected` column divides by the control. **Run it once with both arms
+identical** to see your noise floor: on a small probe, identical code read
+anywhere from 0.7x to 1.4x per metric. A range that straddles 1.00x is not an
+effect.
+
+For CI, [frame_baseline](https://github.com/jameskrupnik/frame_baseline)
+turns frame timings into committed baselines that fail a test on regression.
 
 ## The catalogue
 
-Each of these was found on a shipping app, and most were in its siblings too —
-they came from the same template, so they propagate.
+Each was found in a shipping app, and apps cut from the same template all had
+it.
 
 | Fault | Why it hides | The fix |
 |---|---|---|
-| **Text laid out every frame** | `TextPainter.layout` shapes and line-breaks the string. A "+50" that fades over 40 frames pays 40 times to draw four characters — on the UI thread | Build the paragraph once. If only opacity varies, quantise it and cache one paragraph per step; 16 steps over 0.7s is imperceptible |
-| **A blur per object per frame** | `MaskFilter.blur` cannot fold into the pass it sits in — it needs its own render target and two passes. Drop shadows are the worst offender: one per shape | A `RadialGradient` reaching the same distance is a single fill |
-| **A shader rebuilt every frame** | `LinearGradient(...).createShader(rect)` allocates and defeats caching underneath | Cache it **against the rect it was built for**. Unkeyed, a rotation stretches yesterday's gradient across today's screen |
-| **`Paint()` per draw call** | The cheapest and the most numerous | Hoist when the colour is constant; mutate one reusable `Paint` when it is not |
-| **`.toList()` in a per-frame sweep** | Sixty throwaway lists a second, finding nothing on almost all of them | A reused scratch list; or iterate a const enum instead of a map's keys |
-| **Decoding inside a frame** | An SVG or image decoded in `render` stalls that frame | Rasterize once at load into a `ui.Image` and blit |
+| **Text laid out every frame** | `TextPainter.layout` shapes and line-breaks on the UI thread. A "+50" fading over 40 frames pays 40 times to draw four characters; one cost 1.2ms a frame, more than the rest of the scene. Flame's `TextPaint.render(canvas, 'text', ...)` does the same | Lay out once. If only opacity varies, quantise it and cache one paragraph per step: 16 steps over 0.7s is imperceptible. In Flame, a `TextComponent` |
+| **A blur per object per frame** | `MaskFilter.blur` cannot fold into its pass: it needs its own render target and two passes. Drop shadows are the worst, one per shape | A `RadialGradient` reaching the same distance is one fill |
+| **A shader rebuilt every frame** | `createShader(rect)` allocates and defeats caching underneath | Cache it **keyed on the rect it was built for**. Unkeyed, a rotation stretches the old gradient across the new screen |
+| **`Paint()` per draw call** | The cheapest and most numerous | Hoist when the colour is constant; mutate one reusable `Paint` when not |
+| **`.toList()` in a per-frame sweep** | Sixty throwaway lists a second, usually finding nothing | A reused scratch list, or iterate a const list instead of a map's keys |
+| **Decoding inside a frame** | An image or SVG decoded in `render` stalls that frame | Rasterize once at load into a `ui.Image` and draw it |
 | **`saveLayer` per frame** | An offscreen buffer and a pass switch | Usually avoidable by baking the alpha into the colour |
 
 ## Things that look like wins and are not
 
-- **A blur is not a gradient.** Swapping one for the other has to be looked at,
-  side by side, on a real background. A linear ramp does not fall off like a
-  gaussian, so matching the blur's reach with a two-stop gradient comes out
-  visibly bigger and woollier. A middle stop and a smaller radius fixes it —
-  and the wrong version looked perfectly fine in isolation.
-- **`FilterQuality.medium` on image blits.** A software rasterizer prices it at
-  6x `low`, which looks damning until you notice it rebuilds the mipmap chain
-  per raster pass while Impeller keeps one per texture for the life of the app.
-  Dropping to bilinear aliases a downscaled icon on a 2x display. Do not trade
-  real image quality for a saving no device has confirmed.
-- **A full-screen gradient fill.** It looks expensive and is one of the
-  cheapest things a GPU does. Cache the *shader object*; do not contort the
-  scene to avoid the fill.
+- **A blur is not a gradient.** Compare them side by side on the real
+  background. A linear ramp does not fall off like a gaussian, so a two-stop
+  gradient matched to the blur's reach comes out bigger and woollier. A middle
+  stop and a smaller radius fix it, and the wrong version looked fine alone.
+- **`FilterQuality.medium` on image draws.** The software rasterizer prices it
+  at 6x `low` because it rebuilds mipmaps every pass; Impeller keeps them per
+  texture. Dropping to `low` aliases a downscaled icon on a 2x display. Do not
+  trade image quality for a saving no device has confirmed.
+- **A full-screen gradient fill.** Looks expensive; is one of the cheapest
+  things a GPU does. Cache the shader object; do not contort the scene.
 - **Anything a profiler has not agreed with.** Static findings are where to
   point the probe, not a work list.
 
 ## What a script cannot check
 
-- **Whether the widget layer is rebuilding more than it needs to.** A
-  `ValueListenableBuilder` around a whole HUD rebuilds all of it to change one
-  number; one per readout rebuilds one `Text`. `ValueNotifier<Map>` compares by
-  identity, so assigning a fresh map per frame rebuilds every listener to show
-  the same value.
-- **Whether live state is going through the wrong layer.** Anything changing
-  every frame does not belong in a bloc: an emit per frame rebuilds the widget
-  holding the game surface while the player is dragging across it.
-- **Whether the work is needed at all.** The fastest render is the one for an
-  object that should have been removed two seconds ago.
-- **Startup cost.** Decode-at-load is right, but a launch that awaits forty
-  images is a different complaint from the same user.
-- **What the device actually does.** Everything here is a headless
-  approximation. `flutter run --profile` with the performance overlay, on the
-  oldest phone you support, is the only thing that answers the real question.
-
-## Order
-
-1. Run the script. Treat every finding as a hypothesis.
-2. Stand up the probe if there is not one. Record a baseline.
-3. Fix the FAILs first — text layout and per-frame decoding are the two that
-   land on the UI thread, and the UI thread is what janks.
-4. Re-measure **paired**, with a control. Keep only what the numbers support,
-   and say plainly which effects you could not demonstrate.
-5. Look at anything visual you changed, next to what it replaced.
-6. Add a render test if there is not one — see below.
-7. Leave the probe in `tool/` and a note saying to re-run it.
+- **Widget rebuilds.** A `ValueListenableBuilder` around a whole HUD rebuilds
+  all of it to change one number; one per readout rebuilds one `Text`.
+  `ValueNotifier<Map>` compares by identity, so a fresh map per frame
+  rebuilds every listener to show the same value.
+- **State in the wrong layer.** Anything changing every frame does not belong
+  in a bloc or provider: an emit per frame rebuilds the widget holding the
+  game surface while the player is dragging across it.
+- **Whether the work is needed at all.** The fastest render is for the object
+  that was removed two seconds ago.
+- **What the device does.** All of this is a headless approximation.
+  `flutter run --profile` with the performance overlay, on the oldest phone
+  you support, is the only real answer.
 
 ## The test gap this always uncovers
 
-A game's suite drives `update` and **never calls `render`**. So a shader built
-from an empty rect, a paragraph laid out to the wrong constraints, or a
-gradient whose stops do not ascend all sail past a green suite — and none of
-them is a compile error. The symptom is an invisible object falling through the
-sky.
+A game's suite drives `update` and **never calls `render`**. A shader built
+from an empty rect, a paragraph laid out to the wrong width, gradient stops
+that do not ascend: none is a compile error, and all sail past a green suite.
+The symptom is an invisible object (`render-untested` in the script).
 
-Rasterize every component across its life and assert ink landed:
+Rasterize each component across its life and assert ink landed:
 
 ```dart
 final recorder = ui.PictureRecorder();
 final canvas = Canvas(recorder)..drawRect(bounds, background);
 component.render(canvas);
 final data = await (await recorder.endRecording().toImage(w, h)).toByteData();
-// count pixels that are not the background colour
+// count pixels that differ from the background colour
 ```
 
-**Include a no-op negative control** — assert that drawing *nothing* inks zero
-pixels. Without it, an off-by-one in the pixel comparison makes the whole file
-pass against components that render an empty box.
+**Include a negative control**: drawing nothing must ink zero pixels. Without
+it, an off-by-one in the pixel comparison passes every component, including
+ones that render an empty box.
 
-## Expect the same findings across a portfolio
+## Order of work
 
-These come from the template, so they are in every app cut from it. One sweep
-across eight sibling games found the identical `TextPainter`-per-frame score
-popup in **six of them**, fifteen blurred drop shadows per frame in one, and
-six of the eight with no test that ever called `render`. Fix it in one app,
-carry it to the others, and carry it back into the template — which is the only
-way it stops recurring.
+1. Run the script. Treat each finding as a hypothesis.
+2. Stand up the probe if there is none. Record a baseline.
+3. Fix FAILs first: text layout and decoding land on the UI thread, which is
+   what janks.
+4. Re-measure **paired, with a control**. Keep only what the numbers support,
+   and say plainly which effects you could not demonstrate.
+5. Look at anything visual you changed next to what it replaced.
+6. Add a render test if there is none.
+7. Leave the probe in `tool/` with a note to re-run it.
+
+For layout, text scale, tablets and Reduce Motion, use the `polish` skill;
+its faults hide from a green suite the same way.
+
+## Across several apps
+
+These faults travel with the template an app was cut from: in eight sibling
+games, six had the same per-frame popup layout and six never called `render`
+in a test. Fix the template too, or it comes back with the next app.

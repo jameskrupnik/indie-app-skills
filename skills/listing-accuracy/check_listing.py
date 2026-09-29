@@ -1,211 +1,581 @@
 #!/usr/bin/env python3
-"""Check an app store listing against the app it describes.
+"""Check a Flutter app's store listing against the app it describes.
 
 The failure this catches is a sentence that reads perfectly and is false: a
 listing naming a mode that was deleted, promising there are no adverts of a
 kind the binary now serves, or counting twelve of something the code has six
-of. Nothing in a compiler, a test suite or `deliver` compares the two, and the
-reviewer reads the listing before they open the app.
+of. Nothing in a compiler, a test suite or fastlane `deliver`/`supply`
+compares the two, and the reviewer reads the listing before opening the app.
 
-Exits non-zero on any FAIL. WARNs never fail the run.
+Assumed layout (fastlane's own): listing text in `metadata/` under any of
+`fastlane/`, `ios/fastlane/` or `android/fastlane/`, one directory per locale
+(`metadata/en-US/`, `metadata/android/en-US/`, `metadata/ios/en-US/` all
+work), plus `review_information/notes.txt`. App code is every `.dart` file
+under a `lib/` directory (so `lib/` and `packages/*/lib/` both count), minus
+generated files. App strings also include `.arb`, slang `.i18n.json`/`.yaml`
+and text files under `assets/`.
+
+Exit codes: 0 no FAIL (warnings allowed), 1 at least one FAIL, 2 nothing to
+check (no listing files or no Dart sources).
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-# Words that are capitalised for grammar rather than because they name a thing.
-# Anything here is skipped by the proper-noun check.
-STOPWORDS = {
-    "a", "an", "and", "the", "or", "but", "if", "so", "then", "than", "that",
-    "this", "these", "those", "there", "here", "it", "its", "you", "your",
-    "yours", "we", "our", "us", "they", "them", "their", "he", "she", "his",
-    "her", "one", "two", "three", "four", "five", "six", "seven", "eight",
-    "nine", "ten", "eleven", "twelve", "no", "not", "nothing", "every",
-    "each", "both", "all", "any", "some", "more", "most", "less", "least",
-    "first", "last", "next", "new", "old", "same", "other", "another",
-    "play", "player", "players", "playing", "played", "game", "games", "app",
-    "apps", "screen", "screens", "tap", "hold", "drag", "swipe", "press",
-    "wifi", "ios", "android", "apple", "google", "iphone", "ipad", "store",
-    "when", "where", "what", "who", "why", "how", "while", "after", "before",
-    "with", "without", "from", "into", "over", "under", "on", "off", "in",
-    "out", "up", "down", "left", "right", "for", "to", "of", "at", "by",
-    "is", "are", "was", "were", "be", "been", "being", "do", "does", "did",
-    "can", "could", "will", "would", "should", "may", "might", "must",
-    "have", "has", "had", "get", "gets", "got", "go", "goes", "went",
-    "settings", "delete", "data", "privacy", "support", "review", "notes",
-    "also", "present", "ads", "ad", "coins", "coin", "sound", "sounds",
-    "pause", "paused", "mute", "music", "score", "scores", "best", "target",
-    "targets", "level", "levels", "mode", "modes", "table", "tables",
-    # **Language names are never screen names, and a release note listing the
-    # languages an update added is the one place they all appear at once.**
-    # Taco Rain's "Spanish, Latin American Spanish, Portuguese, Italian and
-    # Polish join the seven that were already here" failed this check five
-    # times over. A reviewer will not go hunting the UI for a button called
-    # "Polish", and the localisations are declared to the store separately, so
-    # there is nothing here for the proper-noun check to protect.
-    # **Month names, for the same reason.** Review notes date things - "the
-    # build reviewed was uploaded on 29 August" - and a reviewer is not going
-    # to search the UI for a screen called "August".
-    "january", "february", "march", "april", "may", "june", "july", "august",
-    "september", "october", "november", "december",
-    "english", "spanish", "portuguese", "italian", "polish", "french",
-    "german", "dutch", "japanese", "korean", "chinese", "russian", "arabic",
-    "hindi", "turkish", "swedish", "danish", "norwegian", "finnish", "greek",
-    "czech", "hungarian", "romanian", "ukrainian", "vietnamese", "thai",
-    "indonesian", "malay", "hebrew", "american", "british", "latin",
-    # The regional qualifiers belong here for the same reason the languages
-    # do, and this list had three of them and not the fourth: "Brazilian
-    # Portuguese" failed every run against an app whose five locales are
-    # declared to the store and which deliberately has no language picker, so
-    # the word appears nowhere in its strings and never will.
-    "brazilian",
-    "languages", "language", "localization", "localizations",
-}
+# ---------------------------------------------------------------------------
+# Tunables. Everything portfolio- or language-specific lives here.
+# ---------------------------------------------------------------------------
+
+# Capitalised words that do not name a thing in the app: grammar, platform and
+# store vocabulary, and words a listing uses about itself. Skipped by the
+# name check. Add per-app exceptions with --allow rather than growing this.
+STOPWORDS = set("""
+a an and the or but if so then than that this these those there here it its
+you your yours we our us they them their he she his her no not nothing every
+each both all any some more most less least first last next new old same
+other another when where what who why how while after before with without
+from into over under on off in out up down left right for to of at by is are
+was were be been being do does did can could will will would should may might
+must have has had get gets got go goes went also just only even still yes
+app apps game games play player players playing screen screens tap taps hold
+drag swipe press settings delete data privacy support review notes version
+update updates build builds test tests tester testers feedback
+ios ipados macos android apple google iphone ipad mac watch store play
+wifi wi fi bluetooth icloud siri voiceover talkback center kit face touch id
+dark light mode reduce motion dynamic type accessibility
+monday tuesday wednesday thursday friday saturday sunday
+january february march april may june july august september october
+november december
+english spanish portuguese italian polish french german dutch japanese
+korean chinese russian arabic hindi turkish swedish danish norwegian finnish
+greek czech hungarian romanian ukrainian vietnamese thai indonesian malay
+hebrew american british latin brazilian european canadian mexican
+simplified traditional language languages localization localizations
+""".split())
+# **Language, region and month names are never screen names**, and a release
+# note that lists the languages an update added is where they all appear at
+# once. The localisations are declared to the store separately, so an app with
+# no language picker never mentions "Polish" in its strings and never will.
+
+# Files whose capitalisation is branding or title case, not a named feature.
+# They are still checked for capability claims and counts.
+NAME_CHECK_SKIPS = {"name.txt", "title.txt", "subtitle.txt", "keywords.txt",
+                    "promotional_text.txt"}
+
+# Words that turn an assertion into a denial when they precede it in the same
+# clause: "no leaderboards", "never shows a rewarded video", "without ads".
+NEGATORS = r"\b(no|not|never|without|nothing|zero|none|n't|free of)\b"
 
 # Claims a listing makes about *classes of thing a store cares about*, and the
-# code that has to exist (or not) for each to be true.
+# code that has to exist (or not) for each to be true. Both directions are
+# checked: "no rewarded video" while one ships is a false promise to a
+# reviewer; a rewarded ad the listing never mentions is an undisclosed one.
 #
-# The direction matters and both are checked. "No rewarded video" while a
-# rewarded ad ships is a false promise to a reviewer; a rewarded ad that the
-# listing never mentions is an undisclosed one. Both have cost real
-# rejections.
+# Each entry:
+#   asserts    regexes over the lowercased listing that claim the capability.
+#              A match preceded by a NEGATOR in the same clause is ignored.
+#   denies     regexes that deny it *for the whole app*. Never mode-scoped:
+#              "no second device" describes one mode of an app that may have
+#              another. Matched per sentence.
+#   code       regexes over comment-stripped Dart that mean it is implemented.
+#   absent_if  regexes over the same code meaning the implementation is
+#              unreachable in a release build (a false flag, test-only ids).
 CAPABILITY_CLAIMS = [
     {
         "name": "rewarded video",
-        # **The last two asserts are the house disclosure wording, and they
-        # were added because rewriting the copy hid a real disclosure.** These
-        # listings used to say "watch an optional video for 3-9 bonus coins";
-        # Google's behavioral policy bars an app that "promises payment or
-        # incentives to users who click on or view ads", so the offer was
-        # rephrased as disclosure - "a video adds 3-9 bonus coins to a task you
-        # have already completed". The feature is disclosed just as plainly and
-        # the words "rewarded video" are gone, so the old patterns reported
-        # four honestly-documented apps as hiding one. A check that fires on
-        # the honest version teaches you to ignore it.
+        # The last two catch disclosure wording that avoids the word
+        # "rewarded" (Google Play bars *incentivising* ad views, so honest
+        # copy often says "a video adds 3 coins" instead). A check that fires
+        # on the honest version teaches you to ignore it.
         "asserts": [
             r"rewarded (video|ad)",
-            r"watch (a|an|one)? ?(short )?(video|ad|advert)",
-            r"a video adds",
-            r"short videos",
+            # "Watch an ad to support us" is an opt-in interstitial, not a
+            # reward, so a bare "watch an ad" needs a payoff after it.
+            r"watch (a|an|one)? ?(short |optional )?(video|ad|advert)s?\b.{0,30}"
+            r"\b(for|to (earn|get|unlock|double|claim|continue))\b",
+            r"\ba video (adds|gives|doubles|unlocks|grants)",
         ],
-        # Do **not** add "never needs a video" here. It denies that the video
-        # is *required*, not that it exists, and the app says it in the same
-        # breath as disclosing the bonus. The existing patterns both require
-        # the word "rewarded" nearby, which is what keeps them apart.
+        # Not "never needs a video": that denies the video is *required*, not
+        # that it exists, and is usually written right beside a disclosure.
         "denies": [r"no rewarded (video|ad)", r"never .{0,20}rewarded"],
         "code": [r"\bRewarded(Interstitial)?Ad\b"],
-        # **A rewarded unit that exists only as Google's public test id is not
-        # shipped.** Asteroid Duel carries the whole hangar implementation and
-        # ships with `androidRewarded`/`iosRewarded` empty in the production
-        # AdUnits, because no rewarded unit has been created in AdMob; the
-        # service reads an empty id as "no ads", never loads, and the offer
-        # never appears. Its listing's "no rewarded video" is true. Matching
-        # `RewardedAd` alone called that app a liar.
-        #
-        # So the gate is the *production* unit id, not the class: absent when
-        # no rewarded id anywhere is outside Google's sample publisher
-        # (3940256099942544), which is debug-only by definition. Written as a
-        # whole-blob negative lookahead because this has to assert that
-        # something is missing, which a plain search cannot do.
-        #
-        # **Match the id, not the field name.** The first version of this gate
-        # looked for `Rewarded:` and flipped three apps that do ship one into
-        # the opposite error, because this portfolio holds three unrelated
-        # shapes for the same constant: `androidRewarded:` in an `AdUnits`
-        # class, `_androidRewardedAdUnitId =` on an `AdService`, and
-        # `_prodRewardedAndroid =` on an `AdUnitIds`. Any identifier containing "rewarded" assigned a non-test
-        # `ca-app-pub-` id covers all three, and the `\s*` spans the newline
-        # two of them wrap on.
+        # **A rewarded unit that exists only as Google's public sample id is
+        # not shipped.** An app can carry the whole implementation with blank
+        # production unit ids; the service reads blank as "no ads" and the
+        # offer never appears. So: absent when rewarded ids appear in code and
+        # every one is on Google's sample publisher (3940256099942544).
+        # **Match the id, not the field name**: `androidRewarded:`,
+        # `_rewardedAdUnitId =` and `prodRewardedAndroid =` are all common
+        # shapes. If your ids come from --dart-define or a config file, this
+        # finds no ids and treats the implementation as present.
         "absent_if": [
-            r"\A(?!(?si:.*rewarded\w*\s*[:=]\s*'ca-app-pub-(?!3940256099942544)))"
+            r"(?si)\A(?=.*rewarded\w*\s*[:=]\s*['\"]ca-app-pub-3940256099942544)"
+            r"(?!.*rewarded\w*\s*[:=]\s*['\"]ca-app-pub-(?!3940256099942544))"
         ],
     },
     {
         "name": "in-app purchase",
-        "asserts": [r"in-app purchase(?!s? of any kind)", r"\bbuy (it|the app|coins)\b", r"one payment"],
-        "denies": [r"no in-app purchase", r"nothing to buy", r"there is no in-app purchase"],
-        "code": [r"\bbuyNonConsumable\b", r"\bqueryProductDetails\b"],
+        "asserts": [r"in-app purchase", r"\bbuy (it|the app|coins|gems|premium)\b",
+                    r"\bone(-time)? payment\b", r"\bsubscription\b"],
+        "denies": [r"no in-app purchase", r"nothing to buy",
+                   r"no subscription", r"free, with no .{0,20}purchase"],
+        "code": [r"\bbuy(Non)?Consumable\b", r"\bqueryProductDetails\b",
+                 r"\bpurchase(Package|StoreProduct|Product)\b"],
         # **A capability behind a compile-time false flag is not shipped.**
-        # Several of these apps carry a whole purchase implementation that
-        # nothing can reach because `selling` is false — no buy tile, no
-        # Restore, no StoreKit call — and for those the listing's "no in-app
-        # purchases" is true. Matching the implementation alone reported every
-        # one of them as a liar, which is the fastest way to teach somebody to
-        # ignore this script.
-        "absent_if": [r"selling\s*=\s*false"],
+        # Match the gate, not the implementation. Adapt to your flag's name.
+        "absent_if": [r"(?i)\b\w*(selling|purchases?|iap)\w*\s*=\s*false\b"],
     },
     {
         "name": "banner or interstitial advertising",
-        "asserts": [r"\bbanner\b", r"\binterstitial\b", r"\badvert(isement)?s?\b"],
+        "asserts": [r"\bbanners?\b", r"\binterstitial\b", r"\badvert(isement)?s?\b",
+                    r"\bad-supported\b"],
         # Not a bare "ad-free": that is usually the name of a purchasable
         # upgrade in an app that very much has ads.
-        "denies": [r"contains no ad", r"no ads at all", r"completely ad-free"],
-        "code": [r"\bBannerAd\b", r"\bInterstitialAd\b", r"google_mobile_ads"],
+        "denies": [r"contains no ad", r"no ads at all", r"completely ad-free",
+],
+        "code": [r"\bBannerAd\b", r"\bInterstitialAd\b", r"\bNativeAd\b",
+                 r"package:google_mobile_ads/"],
     },
     {
         "name": "accounts or sign-in",
-        "asserts": [r"\bsign in\b", r"\bcreate an account\b", r"\blog in\b"],
+        "asserts": [r"\bsign in\b", r"\bsign-in\b", r"\bcreate an account\b", r"\blog in\b"],
         "denies": [r"no account", r"no sign-?in", r"nothing to sign"],
-        "code": [r"signInWith(?!Anonymously)", r"\bcreateUserWith"],
+        "code": [r"signInWith(?!Anonymously)", r"\bcreateUserWith", r"\bGoogleSignIn\b"],
     },
     {
         "name": "online or multi-device play",
-        "asserts": [r"\bonline\b", r"same wi-?fi", r"two devices", r"\bmatchmak", r"\blobby\b"],
-        # **Nothing mode-scoped.** "No second device" and "one phone" describe
-        # a *mode* — the one where two people share a handset — in apps that
-        # also have a two-device mode described three paragraphs later. Read as
-        # global claims they flagged an app for denying a feature it was
-        # advertising on the same page. A denial only counts if it is about the
-        # whole app.
-        # **The denial forms an app actually writes.** Hoverline ships four AI
-        # rivals and says so at length, which makes "this is not multiplayer"
-        # the single most important sentence in its review notes — and saying
-        # it properly means writing the words "matchmaking" and "online",
-        # both of which are asserts. With only the three patterns above, the
-        # most careful disclosure in the family FAILED for making it. Same
-        # shape as the leaderboards entry below, which is rule 3 of this
-        # skill's own guidance.
-        #
-        # All of these are whole-app statements, which is what the note above
-        # requires: none of them can be read as describing one mode of an app
-        # that has another.
+        "asserts": [r"\bonline\b", r"same wi-?fi", r"two devices", r"\bmatchmak",
+                    r"\blobby\b", r"\bmultiplayer\b"],
+        # Whole-app statements only; see the note on `denies` above. "No
+        # matchmaking server" is deliberately absent: an app with nearby
+        # two-device play writes exactly that.
         "denies": [r"no online play", r"\boffline only\b", r"never connects",
-                   r"no matchmaking", r"never goes online",
-                   r"no network connection of any kind",
-                   r"there is no network"],
-        "code": [r"\bNearby\w*\b", r"\bSocket\b", r"\bmultiplayer\b"],
+                   r"never goes online", r"no network connection of any kind",
+                   r"there is no network", r"not (a )?multiplayer"],
+        "code": [r"\bNearby\w*\b", r"\bSocket\b", r"\bWebSocketChannel\b",
+                 r"\bGKMatch\w*\b"],
     },
     {
         "name": "leaderboards",
         "asserts": [r"\bleaderboard"],
-        # **A denial contains an assertion**, which is rule 3 of this skill's
-        # own guidance and this entry was the one place breaking it. "No
-        # accounts, no sign-in, no leaderboards" is an app being honest about
-        # not having one, and with an empty `denies` it was reported as an app
-        # claiming one — a FAIL on the most careful listing in the family.
-        "denies": [r"no leaderboard", r"without .{0,20}leaderboard",
-                   r"leaderboard-free"],
-        # **Not a bare "leaderboard".** That matched `Icons.leaderboard_outlined`
-        # and a comment, and reported a leaderboard in an app with none.
-        # An icon is not a capability; only an API that submits a score is.
+        "denies": [r"no leaderboard", r"without .{0,20}leaderboard", r"leaderboard-free"],
+        # Not a bare "leaderboard": that matches `Icons.leaderboard`. An icon
+        # is not a capability; only an API that submits a score is.
         "code": [r"GameCenter", r"PlayGames", r"submitScore", r"\bLeaderboard\w*\("],
     },
 ]
 
-GENERATED = (".g.dart", ".freezed.dart", ".config.dart", ".gr.dart")
+GENERATED = (".g.dart", ".freezed.dart", ".config.dart", ".gr.dart",
+             ".mocks.dart", ".gen.dart")
+PRUNE = {"build", ".dart_tool", ".git", "Pods", "node_modules", ".gradle",
+         ".symlinks", "ephemeral", ".fvm", "test", "integration_test",
+         "test_driver", "fastlane", "docs"}
+STRING_SUFFIXES = (".arb", ".i18n.json", ".i18n.yaml", ".i18n.yml")
+ASSET_TEXT_SUFFIXES = (".json", ".txt", ".md", ".yaml", ".yml", ".csv", ".arb")
+SENTINELS = r"(none|unknown|unset|empty|invalid|undefined)\b"
+MAX_ASSET_BYTES = 2_000_000
+# Listing files that are not prose: URLs, contact details, credentials.
+NOT_PROSE = re.compile(r"(_url|copyright|video|first_name|last_name|phone_number"
+                       r"|email_address|demo_user|demo_password)\.txt$")
+# "one" and "1" are left out: "move one piece at a time" is not a total.
 NUMBER_WORDS = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
 }
 
 failures: list[str] = []
 warnings: list[str] = []
+passes: list[str] = []
 
+
+def color(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
+
+
+def read(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+# ---------------------------------------------------------------------------
+# Finding files
+# ---------------------------------------------------------------------------
+
+def walk(app: Path):
+    for root, dirs, files in os.walk(app):
+        dirs[:] = [d for d in dirs if d not in PRUNE and not d.startswith(".")
+                   and not d.endswith("webdemo")]
+        for name in files:
+            yield Path(root) / name
+
+
+def metadata_roots(app: Path) -> list[Path]:
+    return [p for p in (app / "fastlane/metadata", app / "ios/fastlane/metadata",
+                        app / "android/fastlane/metadata") if p.is_dir()]
+
+
+def listing_files(app: Path, locale: str) -> list[Path]:
+    """Every human-readable listing file for one locale, plus review notes.
+
+    **The review notes are in scope and are usually the worst offender.** They
+    are written once, read by exactly one person who can reject the app, and
+    revisited by nobody, so they are where a deleted mode survives longest.
+    Android changelogs and any `testflight/` "what to test" copy count too:
+    both send a real person looking for named features.
+    """
+    found: list[Path] = []
+    for root in metadata_roots(app):
+        for path in sorted(root.rglob("*.txt")):
+            parts = path.relative_to(root).parts[:-1]
+            if NOT_PROSE.search(path.name):
+                continue
+            if "review_information" in parts:
+                if path.name == "notes.txt":
+                    found.append(path)
+            elif locale in parts or "default" in parts or "testflight" in parts:
+                found.append(path)
+    return found
+
+
+def dart_files(app: Path) -> list[Path]:
+    return [p for p in walk(app)
+            if p.suffix == ".dart" and "lib" in p.relative_to(app).parts
+            and not p.name.endswith(GENERATED)]
+
+
+def strip_dart_comments(source: str) -> str:
+    """Remove // and /* */ comments, leaving string literals intact.
+
+    **Capability checks must not see comments.** Well-documented code explains
+    at length what the app deliberately does *not* do, so a search over
+    comments finds a rewarded video in an app whose only mention of one is a
+    note saying it has none. A regex cannot strip them safely: `'https://'` is
+    not a comment, and an ad unit id inside a string is what a gate must see.
+    """
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        c = source[i]
+        two = source[i:i + 2]
+        if two == "//":
+            j = source.find("\n", i)
+            i = n if j < 0 else j
+        elif two == "/*":
+            depth, i = 1, i + 2  # Dart block comments nest.
+            while i < n and depth:
+                if source.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif source.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            out.append(" ")
+        elif c in "'\"":
+            raw = i > 0 and source[i - 1] == "r"
+            quote = source[i:i + 3] if source[i:i + 3] in ("'''", '"""') else c
+            j = i + len(quote)
+            while j < n and not source.startswith(quote, j):
+                j += 2 if source[j] == "\\" and not raw else 1
+            j = min(n, j + len(quote))
+            out.append(source[i:j])
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def vocabulary(app: Path, sources: list[str]) -> list[str]:
+    """Every word the app says or names, lowercased, sorted for prefix lookup.
+
+    Identifiers are split on camelCase, so `NearbyLobbyView` contributes
+    "nearby", "lobby" and "view". Deliberately coarse: the question is only
+    "does this word appear anywhere in the app", and false *positives* are
+    what get a check ignored.
+    """
+    parts = list(sources)
+    for path in walk(app):
+        rel = path.relative_to(app).parts
+        if path.name.endswith(STRING_SUFFIXES) or (
+            "assets" in rel and path.name.endswith(ASSET_TEXT_SUFFIXES)
+            and path.stat().st_size <= MAX_ASSET_BYTES
+        ):
+            parts.append(read(path))
+    blob = "\n".join(parts)
+    blob = re.sub(r"([a-z])([A-Z])", r"\1 \2", blob)
+    return sorted({w.lower() for w in re.findall(r"[A-Za-z]+", blob)})
+
+
+def known(word: str, vocab: list[str]) -> bool:
+    """Exact, singular/plural, or as the start of a longer word (escort ->
+    escorting). Never the other way round: a short vocab token must not
+    vouch for a longer listing word."""
+    w = word.lower()
+    for stem in {w, w[:-1] if w.endswith("s") else w, w[:-2] if w.endswith("es") else w}:
+        i = bisect.bisect_left(vocab, stem)
+        if i < len(vocab) and vocab[i].startswith(stem):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+
+BULLET = re.compile(r"^\s*(?:[-*•·–—>]|\d+[.)])\s*")
+
+
+def check_names(files: list[Path], vocab: list[str], allow: set[str]) -> None:
+    """Named things in the listing that the app has never heard of.
+
+    A capitalised word mid-sentence, or any "Quoted Thing", is almost always
+    the name of a screen, mode or character. If the app's own strings and
+    source never mention it, the listing is describing a different app,
+    usually the one this was forked from.
+    """
+    unknown: dict[str, set[str]] = {}
+    for path in files:
+        if path.name in NAME_CHECK_SKIPS:
+            continue
+        for line in read(path).splitlines():
+            line = BULLET.sub("", line)
+            quoted = list(re.finditer(r'["“]([A-Za-z][A-Za-z \'’-]{1,28})["”]', line))
+            candidates = {q.group(1) for q in quoted}
+            for m in re.finditer(r"\b[A-Z][a-z]{2,}\b", line):
+                if any(q.start() < m.start() < q.end() for q in quoted):
+                    continue  # already judged as part of the quoted name
+                before = line[:m.start()].rstrip(" \"'(“‘")
+                if before and before[-1] not in ".!?:":
+                    candidates.add(m.group(0))
+            for raw in candidates:
+                words = [w for w in re.split(r"[^A-Za-z]+", raw) if w]
+                if any(w.lower() not in STOPWORDS and w.lower() not in allow
+                       and not known(w, vocab) for w in words):
+                    unknown.setdefault(raw.strip(), set()).add(path.name)
+
+    if not unknown:
+        passes.append("Every name in the listing exists somewhere in the app")
+        return
+    lines = [f"{len(unknown)} name(s) in the listing appear nowhere in the app:"]
+    lines += [f"  {n!r}  ({', '.join(sorted(unknown[n]))})" for n in sorted(unknown)]
+    lines += [
+        "A screen, mode or character the app does not have is the most",
+        "expensive thing a listing can contain: a reviewer told to try it will",
+        "look for it, fail, and reject on 2.3 Accurate Metadata.",
+        "(Not a feature name? Pass --allow WORD.)",
+    ]
+    fail("\n       ".join(lines))
+
+
+def sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+|\n\s*\n|\n(?=\s*(?:[-*•]|\d+[.)]))", text) if s.strip()]
+
+
+def asserts_in(sentence: str, patterns: list[str]) -> bool:
+    """True if a pattern matches and is not negated earlier in its clause.
+
+    **A denial contains an assertion.** "No accounts, no sign-in, no
+    leaderboards" matches "leaderboard", and without this every honest
+    disclaimer reads as a claim.
+    """
+    for p in patterns:
+        for m in re.finditer(p, sentence):
+            clause = re.split(r"[,;:()—]|\band\b|\bbut\b", sentence[:m.start()])[-1]
+            if not re.search(NEGATORS, clause):
+                return True
+    return False
+
+
+def check_capabilities(files: list[Path], code: str) -> None:
+    """Claims about adverts, purchases, accounts, online play, leaderboards."""
+    text = "\n\n".join(read(p) for p in files).lower().replace("’", "'")
+    parts = sentences(text)
+
+    clean = True
+    for claim in CAPABILITY_CLAIMS:
+        implemented = any(re.search(p, code) for p in claim["code"])
+        gated = implemented and any(re.search(p, code) for p in claim.get("absent_if", []))
+        present = implemented and not gated
+        denied = any(re.search(p, s) for s in parts for p in claim["denies"])
+        # **A denial wins over an assertion in the same sentence**, because it
+        # usually contains one.
+        asserted = any(
+            asserts_in(s, claim["asserts"]) for s in parts
+            if not any(re.search(p, s) for p in claim["denies"])
+        )
+        name = claim["name"]
+
+        if denied and present:
+            clean = False
+            fail(
+                f"The listing says the app has no {name}, and the code has one."
+                "\n       This is a promise to a reviewer that the binary breaks."
+                "\n       If the implementation is unreachable in a release build"
+                "\n       (a false flag, test-only ad unit ids), add that gate to"
+                "\n       this claim's `absent_if` and say so in the review notes:"
+                "\n       a reviewer cannot see a blank unit id."
+            )
+        elif asserted and gated:
+            clean = False
+            fail(
+                f"The listing describes {name}. The code implements it, but it"
+                "\n       looks switched off in a release build (its `absent_if`"
+                "\n       gate matched). Enable it before release, or take it out"
+                "\n       of the copy."
+            )
+        elif asserted and not implemented:
+            clean = False
+            fail(
+                f"The listing describes {name} and the code has none. Either it"
+                "\n       was removed and the copy was not, or the copy came from"
+                "\n       the app this one was forked from."
+            )
+        elif present and not asserted and not denied:
+            clean = False
+            warn(
+                f"The app has {name} and no listing file mentions it."
+                "\n       Undisclosed is not the same as absent; say so in the"
+                "\n       review notes at least."
+            )
+    if clean:
+        passes.append("Advertising, purchase, account and online claims match the code")
+
+
+def top_level_items(body: str) -> list[str]:
+    """Split a list or enum body on commas at bracket depth 0, stopping at
+    the first depth-0 `;` (where an enhanced enum's members end)."""
+    items, depth, start = [], 0, 0
+    for i, c in enumerate(body):
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        elif c == ";" and depth == 0:
+            body = body[:i]
+            break
+        elif c == "," and depth == 0:
+            items.append(body[start:i])
+            start = i + 1
+    items.append(body[start:])
+    return [s.strip() for s in items if s.strip()]
+
+
+def matching_close(source: str, open_index: int) -> int:
+    pairs = {"{": "}", "[": "]"}
+    opener, closer = source[open_index], pairs[source[open_index]]
+    depth = 0
+    for i in range(open_index, len(source)):
+        if source[i] == opener:
+            depth += 1
+        elif source[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(source)
+
+
+def collection_counts(sources: list[str]) -> dict[str, int]:
+    """Named lists and enums in the code, keyed by lowercased name.
+
+    - `enum Theme { a, b, c }` -> "theme": 3 (members only, not methods).
+    - `static const all = <Level>[...]` -> keyed on the *enclosing class*.
+    - `const themes = <ThemeSpec>[...]` / `const List<ThemeSpec> themes = [`
+      -> "themes", counted by `ThemeSpec(` constructor calls, because list
+      items are multi-line calls with their own commas.
+
+    `const` only: a `final` list is usually built in a loop, so its literal
+    says nothing about its length. Sentinel enum members (`none`, `unknown`)
+    are not counted: "three medals" is right for `{none, bronze, silver, gold}`.
+    """
+    counts: dict[str, int] = {}
+    for source in sources:
+        for m in re.finditer(r"\benum\s+(\w+)[^{;]*\{", source):
+            body = source[m.end():matching_close(source, m.end() - 1)]
+            members = [s for s in top_level_items(body)
+                       if re.match(r"(@\w+(\([^)]*\))?\s*)*[A-Za-z_]\w*\s*(\(|$)", s, re.S)
+                       and not re.match(SENTINELS, s)]
+            if members:
+                counts.setdefault(m.group(1).lower(), len(members))
+
+        classes = [(m.group(1), m.end() - 1)
+                   for m in re.finditer(r"\bclass\s+(\w+)[^{;]*\{", source)]
+        for m in re.finditer(
+            r"(?:static\s+)?const\s+(?:List<(\w+)>\s+)?(\w+)\s*=\s*"
+            r"(?:const\s*)?(?:<(\w+)>)?\[", source,
+        ):
+            element, name = m.group(1) or m.group(3), m.group(2)
+            if not element:
+                continue
+            body = source[m.end():matching_close(source, m.end() - 1)]
+            found = len(re.findall(rf"\b{re.escape(element)}(\.\w+)?\s*\(", body))
+            if not found:
+                continue
+            if name == "all":
+                owners = [c for c, start in classes if start < m.start()]
+                if not owners:
+                    continue
+                key = owners[-1]
+            else:
+                key = re.sub(r"^(_|k(?=[A-Z]))", "", name)
+            counts.setdefault(key.lower(), found)
+    return counts
+
+
+def check_counts(files: list[Path], sources: list[str]) -> None:
+    """ "Twelve tables", "six themes" against the real lists and enums.
+
+    Advisory rather than a failure: mapping a noun to a Dart list is a guess,
+    and a guess that fails a build gets the check skipped. It is here because
+    a stale count survives every test and drifts whenever content is added.
+    """
+    counts = collection_counts(sources)
+    if not counts:
+        return
+    text = "\n".join(read(p) for p in files)
+    checked = False
+    number = (r"\b([2-9]|[1-9]\d{1,2}|" + "|".join(NUMBER_WORDS)
+              + r")\s+([a-z]{3,})(?:[ -]([a-z]{3,}))?\b")
+
+    def stem(word: str) -> str:
+        word = re.sub(r"our", "or", word)  # colour -> color
+        return word[:-1] if word.endswith("s") else word
+
+    seen: set[tuple[str, str]] = set()
+    for match in re.finditer(number, text, re.I):
+        raw, noun, following = (g.lower() if g else "" for g in match.groups())
+        claimed = NUMBER_WORDS.get(raw) or int(raw)
+        # "six hull colours" is about `HullColor`, not `hulls`: try the
+        # two-word noun first and only fall back to the single word.
+        candidates = [(stem(noun + following), f"{raw} {noun} {following}")] if following else []
+        candidates.append((stem(noun), f"{raw} {noun}"))
+        for key, phrase in candidates:
+            # **Exact, after stripping one plural on each side.** Prefix
+            # matching related "tables" to `TableSpec`, `TableTheme` and
+            # `TableEnd`: three warnings about one sentence, two of them
+            # nonsense.
+            hits = [(k, n) for k, n in counts.items() if stem(k) == key]
+            if not hits:
+                continue
+            checked = True
+            for kind, actual in hits:
+                if actual != claimed and (phrase, kind) not in seen:
+                    seen.add((phrase, kind))
+                    warn(f'The listing says "{phrase}" and the code has'
+                         f"\n       {actual} ({kind}). One of them is stale.")
+            break
+    if checked:
+        passes.append("Counted claims in the listing were checked against the code")
+
+
+# ---------------------------------------------------------------------------
 
 def fail(msg: str) -> None:
     failures.append(msg)
@@ -215,299 +585,66 @@ def warn(msg: str) -> None:
     warnings.append(msg)
 
 
-def ok(msg: str) -> None:
-    print(f"  \033[32m✓\033[0m {msg}")
-
-
-def listing_files(app: Path) -> list[Path]:
-    """Every human-readable listing file, including the review notes.
-
-    **The review notes are in scope and are usually the worst offender.** They
-    are written once, read by exactly one person who can reject the app, and
-    nobody revisits them — so they are where a deleted mode survives longest.
-
-    TestFlight "what to test" copy is in scope for the same reason and was
-    missed by the first version of this script: it tells real testers to go and
-    find named features, so a stale one sends them looking for something that
-    is not there and turns a test round into a bug report about the notes.
-    """
-    found: list[Path] = []
-    for pattern in (
-        "fastlane/metadata/*/en-US/*.txt",
-        "fastlane/metadata/*/review_information/notes.txt",
-        "fastlane/metadata/*/testflight/*.txt",
-        "fastlane/metadata/*/changelogs/*.txt",
-        "fastlane/metadata/android/en-US/*.txt",
-    ):
-        found.extend(sorted(app.glob(pattern)))
-    # URLs and copyright lines are not prose and only add noise.
-    return [p for p in found if not p.name.endswith(("_url.txt", "copyright.txt"))]
-
-
-def app_vocabulary(app: Path) -> str:
-    """Everything the app itself says or names, as one lowercased blob.
-
-    Deliberately coarse. The question is only "does this word appear anywhere
-    in the app", so precision costs nothing here and false *positives* are what
-    make a check get ignored.
-    """
-    parts: list[str] = []
-    for path in app.rglob("*.i18n.json"):
-        parts.append(path.read_text(encoding="utf-8", errors="ignore"))
-    for path in list(app.glob("lib/**/*.dart")) + list(app.glob("packages/*/lib/**/*.dart")):
-        if path.name.endswith(GENERATED):
-            continue
-        parts.append(path.read_text(encoding="utf-8", errors="ignore"))
-    return "\n".join(parts).lower()
-
-
-def code_blob(app: Path) -> str:
-    """Non-generated Dart, **with comments stripped**.
-
-    The comments in these repos explain at length what the app deliberately
-    does *not* do, so matching capability patterns against them finds a
-    rewarded video in an app whose only mention of one is a note saying it has
-    none. Doc comments are the densest source of exactly the words being
-    searched for.
-    """
-    parts: list[str] = []
-    for path in list(app.glob("lib/**/*.dart")) + list(app.glob("packages/*/lib/**/*.dart")):
-        if path.name.endswith(GENERATED):
-            continue
-        source = path.read_text(encoding="utf-8", errors="ignore")
-        source = re.sub(r"/\*.*?\*/", " ", source, flags=re.S)
-        source = re.sub(r"^\s*///?.*$", "", source, flags=re.M)
-        parts.append(source)
-    return "\n".join(parts)
-
-
-def check_proper_nouns(files: list[Path], vocab: str) -> None:
-    """Named things in the listing that the app has never heard of.
-
-    A capitalised word mid-sentence, or any Quoted "Thing", is almost always
-    the name of a screen, a mode or a character. If the app's own strings and
-    source never mention it, the listing is describing a different app —
-    usually the one this was forked from.
-    """
-    unknown: dict[str, set[str]] = {}
-    for path in files:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        candidates: set[str] = set()
-        # Quoted names first: the review notes label buttons this way.
-        candidates.update(re.findall(r'"([A-Za-z][A-Za-z \'-]{1,28})"', text))
-        # Then capitalised words that are not starting a sentence or a line.
-        for match in re.finditer(r"(?<![.!?:\n]\s)(?<!^)\b([A-Z][a-z]{2,})\b", text, re.M):
-            candidates.add(match.group(1))
-        for raw in candidates:
-            words = [w for w in re.split(r"[^A-Za-z']+", raw) if w]
-            # A quoted phrase is known if every word in it is known.
-            missing = [
-                w for w in words
-                if w.lower() not in STOPWORDS and w.lower() not in vocab
-            ]
-            if missing:
-                unknown.setdefault(raw.strip(), set()).add(path.name)
-
-    if not unknown:
-        ok("Every name in the listing exists somewhere in the app")
-        return
-    lines = [
-        f"{len(unknown)} name(s) in the listing appear nowhere in the app:",
-    ]
-    for name in sorted(unknown):
-        lines.append(f"  {name!r}  ({', '.join(sorted(unknown[name]))})")
-    lines.append(
-        "A screen, mode or character the app does not have is the single most"
-    )
-    lines.append(
-        "expensive thing a listing can contain: a reviewer told to try it will"
-    )
-    lines.append("look for it, fail, and reject on 2.3 Accurate Metadata.")
-    fail("\n       ".join(lines))
-
-
-def check_capabilities(files: list[Path], code: str) -> None:
-    """Claims about adverts, purchases, accounts and online play."""
-    text = "\n".join(
-        p.read_text(encoding="utf-8", errors="ignore") for p in files
-    ).lower()
-
-    clean = True
-    for claim in CAPABILITY_CLAIMS:
-        present = any(re.search(p, code) for p in claim["code"]) and not any(
-            re.search(p, code) for p in claim.get("absent_if", [])
-        )
-        denied = any(re.search(p, text) for p in claim["denies"])
-        # **A denial wins over an assertion, because it contains one.** "There
-        # are no in-app purchases" matches the phrase "in-app purchase", so
-        # reading the two independently made every honest disclaimer look like
-        # a claim — and the script then failed the app for describing a feature
-        # it had just said it did not have.
-        asserted = not denied and any(
-            re.search(p, text) for p in claim["asserts"]
-        )
-
-        if denied and present:
-            clean = False
-            fail(
-                f"The listing says the app has no {claim['name']}, and the code"
-                f"\n       has one. This is a promise to a reviewer that the"
-                f"\n       binary breaks."
-                f"\n"
-                f"\n       Before rewriting the copy, check whether it is"
-                f"\n       reachable in a *release* build: these apps routinely"
-                f"\n       carry a full implementation behind blank production"
-                f"\n       unit ids or a false flag, and an unreachable feature"
-                f"\n       makes the claim true. If that is the case, add the"
-                f"\n       gate to this claim's `absent_if` so the next run is"
-                f"\n       quiet — and say so in the review notes, because a"
-                f"\n       reviewer cannot see a blank unit id."
-            )
-        elif present and not asserted:
-            clean = False
-            warn(
-                f"The app has {claim['name']} and no listing file mentions it."
-                f"\n       Undisclosed is not the same as absent; say so in the"
-                f"\n       review notes at least."
-            )
-        elif asserted and not present:
-            clean = False
-            fail(
-                f"The listing describes {claim['name']} and the code has none."
-                f"\n       Either it was removed and the copy was not, or the copy"
-                f"\n       came from the app this one was forked from."
-            )
-    if clean:
-        ok("Advertising, purchase and account claims match the code")
-
-
-def check_counts(files: list[Path], app: Path) -> None:
-    """"Twelve tables", "six themes", "ten badges" — against the real lists.
-
-    Advisory rather than a failure: the mapping from a noun to a Dart list is a
-    guess, and a check that guesses wrong and fails is a check people learn to
-    skip. It is here because a stale count is invisible, survives every test,
-    and is exactly the kind of thing that drifts when content is added.
-    """
-    counts: dict[str, int] = {}
-    for path in list(app.glob("packages/*/lib/**/*.dart")) + list(app.glob("lib/**/*.dart")):
-        if path.name.endswith(GENERATED):
-            continue
-        source = path.read_text(encoding="utf-8", errors="ignore")
-
-        # **Keyed on the enclosing class, not the element type.** `Tables.all`
-        # is a `List<TableSpec>`, and keying on `TableSpec` gave "tablespec",
-        # which prefix-matched the word "tables" in the listing along with
-        # "tabletheme" and "tableend" — three warnings about one sentence, two
-        # of them nonsense.
-        for match in re.finditer(
-            r"(?:abstract\s+)?(?:final\s+)?class\s+(\w+)\s*\{(.*?)\n\}",
-            source,
-            re.S,
-        ):
-            holder, body = match.group(1), match.group(2)
-            listing = re.search(
-                r"static const (?:List<\w+> )?all\s*=\s*<(\w+)>\[(.*?)\];",
-                body,
-                re.S,
-            )
-            if not listing:
-                continue
-            element = listing.group(1)
-            # Counted by constructor calls, not by splitting on commas: these
-            # are multi-line literals whose arguments are themselves
-            # comma-separated, which counted twelve tables as eighty-four.
-            found = len(re.findall(rf"\b{re.escape(element)}\s*\(", listing.group(2)))
-            if found:
-                counts[holder.lower()] = found
-
-        # `enum Thing { a, b, c }` — power-ups and the like.
-        #
-        # **Only the head of the body, up to the first `;`.** A Dart enum may
-        # carry methods, and scanning the whole block counted `for` and `if`
-        # from their bodies as members — which reported ten achievements as
-        # twelve and produced a confident, wrong warning about the listing.
-        for match in re.finditer(r"enum (\w+)\s*\{(.*?)\n\}", source, re.S):
-            kind, body = match.group(1), match.group(2).split(";")[0]
-            members = re.findall(r"^\s*([a-z]\w*)\s*[,(]", body, re.M)
-            if members:
-                counts.setdefault(kind.lower(), len(members))
-
-    if not counts:
-        return
-
-    text = "\n".join(p.read_text(encoding="utf-8", errors="ignore") for p in files)
-    found = False
-    for match in re.finditer(
-        r"\b(\d{1,3}|" + "|".join(NUMBER_WORDS) + r")\s+([a-z]{3,})\b",
-        text,
-        re.I,
-    ):
-        raw, noun = match.group(1).lower(), match.group(2).lower()
-        claimed = NUMBER_WORDS.get(raw, None)
-        if claimed is None:
-            if not raw.isdigit():
-                continue
-            claimed = int(raw)
-        singular = noun[:-1] if noun.endswith("s") else noun
-        for kind, actual in counts.items():
-            # **Exact, after stripping one plural on each side.** Prefix
-            # matching was tried and is what produced the "Twelve tables" /
-            # "tablespec 84" nonsense: in a codebase where half the types start
-            # with the same word, a prefix match relates almost anything to
-            # almost anything.
-            if kind.rstrip("s") == singular:
-                found = True
-                if actual != claimed:
-                    warn(
-                        f'The listing says "{match.group(0)}" and the code has'
-                        f"\n       {actual} ({kind}). One of them is stale."
-                    )
-    if found:
-        ok("Counted claims in the listing were checked against the code")
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--app", default=".", help="app directory (default: cwd)")
-    parser.add_argument("--listing", action="append", default=[],
-                        help="extra listing file to check; repeatable")
-    parser.add_argument("--json", action="store_true", help="machine-readable")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--app", default=".", help="Flutter app directory (default: cwd)")
+    parser.add_argument("--locale", default="en-US",
+                        help="listing locale directory to check (default: en-US)")
+    parser.add_argument("--listing", action="append", default=[], metavar="FILE",
+                        help="extra listing file to check, e.g. copy kept outside "
+                             "fastlane; repeatable")
+    parser.add_argument("--allow", action="append", default=[], metavar="WORD",
+                        help="capitalised word that is not a feature name "
+                             "(a brand, a place); repeatable")
+    parser.add_argument("--json", action="store_true",
+                        help="print only a JSON object {failures, warnings, passes}")
     args = parser.parse_args()
 
     app = Path(args.app).resolve()
-    files = listing_files(app) + [Path(p) for p in args.listing]
+    files = listing_files(app, args.locale) + [Path(p) for p in args.listing]
     files = [p for p in files if p.is_file()]
+
+    def stop(message: str) -> int:
+        if args.json:
+            print(json.dumps({"error": message, "failures": [], "warnings": [],
+                              "passes": []}, indent=2))
+        else:
+            print(message, file=sys.stderr)
+        return 2
+
     if not files:
-        print(f"No listing files under {app}/fastlane/metadata. Nothing to check.")
-        return 0
+        return stop(f"No {args.locale} listing files under {app}/"
+                    "{fastlane,ios/fastlane,android/fastlane}/metadata and no "
+                    "--listing given. Nothing was checked.")
+    paths = dart_files(app)
+    if not paths:
+        return stop(f"No Dart sources under a lib/ directory in {app}. "
+                    "Is this a Flutter app?")
+    sources = [read(p) for p in paths]
+    stripped = [strip_dart_comments(s) for s in sources]
 
-    if not args.json:
-        print(f"\nListing accuracy — {app.name}")
-        print(f"  {len(files)} listing file(s)\n")
-
-    vocab = app_vocabulary(app)
-    code = code_blob(app)
-    if not vocab.strip():
-        print("No Dart sources found — is this an app repo?", file=sys.stderr)
-        return 1
-
-    check_proper_nouns(files, vocab)
-    check_capabilities(files, code)
-    check_counts(files, app)
+    check_names(files, vocabulary(app, sources), {w.lower() for w in args.allow})
+    check_capabilities(files, "\n".join(stripped))
+    check_counts(files, stripped)
 
     if args.json:
-        print(json.dumps({"failures": failures, "warnings": warnings}, indent=2))
+        print(json.dumps({"app": str(app), "files": [str(p) for p in files],
+                          "failures": failures, "warnings": warnings,
+                          "passes": passes}, indent=2))
         return 1 if failures else 0
 
+    print(f"\nListing accuracy: {app.name} ({len(files)} listing file(s), {args.locale})\n")
+    for message in passes:
+        print(f"  {color('32', 'ok')} {message}")
     for message in warnings:
-        print(f"\n\033[33m  ! {message}\033[0m")
+        print(f"\n  {color('33', 'WARN')} {message}")
+    for message in failures:
+        print(f"\n  {color('31', 'FAIL')} {message}")
     if failures:
-        print(f"\n\033[31m{len(failures)} check(s) failed:\033[0m\n")
-        for message in failures:
-            print(f"  \033[31m✗\033[0m {message}\n")
+        print(f"\n{len(failures)} check(s) failed.\n")
         return 1
-    print("\nListing and app agree.\n")
+    print("\nListing and app agree." + (" (warnings above)" if warnings else "") + "\n")
     return 0
 
 

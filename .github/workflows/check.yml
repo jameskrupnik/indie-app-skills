@@ -1,0 +1,52 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scripts:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile every script
+        run: python -m py_compile skills/*/*.py
+      - name: Every script answers --help
+        run: |
+          for f in skills/*/*.py; do
+            echo "== $f"
+            python "$f" --help > /dev/null
+          done
+      - name: Shell syntax
+        run: for f in skills/*/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck --severity=warning skills/*/*.sh
+
+  skills:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every SKILL.md has a name matching its folder and a description under 1024 characters
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          bad = 0
+          for p in sorted(pathlib.Path("skills").glob("*/SKILL.md")):
+              text = p.read_text()
+              front = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+              if not front:
+                  print(f"{p}: no frontmatter"); bad += 1; continue
+              fields = dict(re.findall(r"^(\w+): (.*)$", front.group(1), re.M))
+              if fields.get("name") != p.parent.name:
+                  print(f"{p}: name {fields.get('name')!r} != folder {p.parent.name!r}"); bad += 1
+              desc = fields.get("description", "")
+              if not desc or len(desc) > 1024:
+                  print(f"{p}: description length {len(desc)}"); bad += 1
+          sys.exit(bad)
+          PY

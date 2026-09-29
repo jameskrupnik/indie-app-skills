@@ -1,70 +1,120 @@
 #!/usr/bin/env python3
-"""Static checks for the polish faults that hide from a green test suite.
+"""Static checks for the polish faults a green Flutter test suite never sees.
 
-Every check here fired for real on a shipping app whose `flutter analyze` was
-clean and whose suite was green. None of them is a style opinion: each one is a
-thing a user sees and a test does not.
+Each one is a thing a user sees and a test does not:
 
-Advisory by design. Exits 0 unless --strict.
+  content-cap      a max content width no tablet reaches in portrait
+  reduce-motion    a looping animation in a file that ignores Reduce Motion
+  fixed-aspect     a literal childAspectRatio, which clips text or wastes space
+  icon-label       an IconButton with no tooltip, so no accessible name
+  haptics-switch   haptics that bypass the system switch, with no in-app one
+  untested-scale   no test sets a large text scale
+  untested-tablet  no test renders at a tablet size
+
+A shape can be deliberate, so everything is advisory: exits 0 unless
+--strict. Python 3.9+, stdlib only.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Dict, List, Optional, Set
 
-# The narrowest tablet the app can be installed on, in logical points (iPad
-# mini). A content cap wider than this never engages on any tablet in portrait,
-# which is the single most common way "we handled tablets" turns out to be
-# false.
+# The narrowest iPad in portrait, in logical points (iPad mini). A content cap
+# wider than this never engages on that tablet; one wider than 1024 (the
+# largest iPad in portrait) never engages on any.
 NARROWEST_TABLET = 744
+# A shortest side at least this big is a tablet, not a phone.
+TABLET_SHORTEST_SIDE = 600
+
+SKIP_DIRS = {"build", "ios", "android", "macos", "windows", "linux", "web"}
+GENERATED = (".g.dart", ".freezed.dart", ".config.dart", ".gr.dart",
+             ".mocks.dart")
 
 
 @dataclass
 class Finding:
     check: str
-    level: str  # FAIL | WARN
+    level: str  # FAIL | WARN | NOTE
     path: str
     line: int
     message: str
 
 
+def dart_files(root: Path, *tops: str) -> List[Path]:
+    """Non-generated .dart files under any `lib/`, `test/`... directory in
+    [root], so monorepos (packages/*, apps/*) work. Hidden directories are
+    pruned, which keeps `.dart_tool` and an FVM SDK out of the scan."""
+    out: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".") and d not in SKIP_DIRS]
+        parts = Path(dirpath).relative_to(root).parts
+        if not any(t in parts for t in tops):
+            continue
+        for name in filenames:
+            if name.endswith(".dart") and not name.endswith(GENERATED):
+                out.append(Path(dirpath) / name)
+    return sorted(out)
+
+
+def strip_comments(text: str) -> str:
+    """Blank comments, keeping offsets and newlines, so a doc comment that
+    explains a fix is not reported as the fault."""
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        two = text[i:i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out[i:j] = " " * (j - i)
+            i = j
+        elif two == "/*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+        elif text[i] in "'\"":
+            # Skip string bodies so `//` inside a URL is not a comment.
+            quote = text[i]
+            end = quote * 3 if text[i:i + 3] == quote * 3 else quote
+            j = i + len(end)
+            while j < n and text[j:j + len(end)] != end:
+                j += 2 if text[j] == "\\" else 1
+            i = j + len(end)
+        else:
+            i += 1
+    return "".join(out)
+
+
 @dataclass
 class Repo:
     root: Path
-    lib: list[Path] = field(default_factory=list)
-    tests: list[Path] = field(default_factory=list)
+    lib: List[Path] = field(default_factory=list)
+    tests: List[Path] = field(default_factory=list)
+    _cache: Dict[Path, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, root: Path) -> "Repo":
-        def dart(*globs: str) -> list[Path]:
-            out: list[Path] = []
-            for g in globs:
-                out += [
-                    p
-                    for p in root.glob(g)
-                    if "/build/" not in str(p)
-                    and not p.name.endswith(".g.dart")
-                    and not p.name.endswith(".freezed.dart")
-                    and ".dart_tool" not in str(p)
-                ]
-            return sorted(set(out))
-
-        return cls(
-            root=root,
-            lib=dart("lib/**/*.dart", "packages/*/lib/**/*.dart"),
-            tests=dart("test/**/*.dart", "packages/*/test/**/*.dart",
-                       "integration_test/**/*.dart"),
-        )
+        return cls(root=root, lib=dart_files(root, "lib"),
+                   tests=dart_files(root, "test", "integration_test"))
 
     def read(self, path: Path) -> str:
-        try:
-            return path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return ""
+        if path not in self._cache:
+            try:
+                raw = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                raw = ""
+            self._cache[path] = strip_comments(raw)
+        return self._cache[path]
 
     def rel(self, path: Path) -> str:
         try:
@@ -73,50 +123,127 @@ class Repo:
             return str(path)
 
 
-def check_reduce_motion(repo: Repo) -> list[Finding]:
-    """Ambient animation that never stops is what Reduce Motion is for.
+def line_of(text: str, pos: int) -> int:
+    return text.count("\n", 0, pos) + 1
 
-    A looping AnimationController runs from the moment its screen appears until
-    the user leaves it, with nothing triggering it and nothing ending it. If the
-    file that owns it has never heard of `disableAnimations`, it does not stop.
+
+def check_content_cap(repo: Repo) -> List[Finding]:
+    """A max-width wider than the narrowest tablet never engages on it.
+
+    A wide cap is legitimate for a two-pane landscape layout. Having no
+    narrow one is the fault: every list runs edge to edge on every tablet
+    while the code looks handled.
+    """
+    pattern = re.compile(
+        r"(?:static\s+)?const\s+(?:double\s+)?\w*(?:maxWidth|MaxWidth|"
+        r"contentWidth|ContentWidth|readableWidth|ReadableWidth)\w*\s*=\s*"
+        r"([0-9]+(?:\.[0-9]+)?)")
+    caps = []
+    for path in repo.lib:
+        text = repo.read(path)
+        for m in pattern.finditer(text):
+            caps.append((path, line_of(text, m.start()), float(m.group(1))))
+    if not caps or any(v <= NARROWEST_TABLET for _, _, v in caps):
+        return []
+    path, line, value = min(caps, key=lambda c: c[2])
+    where = ("any iPad in portrait (largest is 1024pt)" if value > 1024 else
+             f"the smallest iPad in portrait ({NARROWEST_TABLET}pt)")
+    return [Finding(
+        "content-cap", "FAIL" if value > 1024 else "WARN", repo.rel(path),
+        line, f"the narrowest content cap is {value:g}, which never engages "
+        f"on {where}: lists run edge to edge",
+    )]
+
+
+def reduce_motion_helpers(repo: Repo) -> Set[str]:
+    """Names of getters/functions that wrap `disableAnimations`, so a file
+    that calls `context.reduceMotion` counts as honouring it."""
+    names: Set[str] = set()
+    decl = re.compile(r"(?:\bget\s+(\w+)|\b(\w+)\s*\([^()]*\)\s*(?:=>|\{))")
+    for path in repo.lib:
+        text = repo.read(path)
+        for m in re.finditer(r"disableAnimations", text):
+            before = text[max(0, m.start() - 200):m.start()]
+            found = list(decl.finditer(before))
+            if found:
+                name = found[-1].group(1) or found[-1].group(2)
+                if len(name) >= 4 and name not in {"build", "maybeOf"}:
+                    names.add(name)
+    return names
+
+
+def check_reduce_motion(repo: Repo) -> List[Finding]:
+    """A looping controller runs from the moment its screen appears until the
+    user leaves. If its file never consults Reduce Motion, it never stops."""
+    honour = ["disableAnimations"] + sorted(reduce_motion_helpers(repo))
+    honours = re.compile(r"\b(?:%s)\b|disableAnimations" %
+                         "|".join(map(re.escape, honour)))
+    out = []
+    for path in repo.lib:
+        text = repo.read(path)
+        if "AnimationController" not in text or honours.search(text):
+            continue
+        m = re.search(r"\.repeat\s*\(", text)
+        if m:
+            out.append(Finding(
+                "reduce-motion", "WARN", repo.rel(path), line_of(text, m.start()),
+                "a looping animation in a file that never checks "
+                "MediaQuery.disableAnimationsOf (Reduce Motion)",
+            ))
+    return out
+
+
+def check_fixed_aspect(repo: Repo) -> List[Finding]:
+    """A fixed childAspectRatio ties cell height to width; text wrapping does
+    the opposite (wider means fewer lines). Wrong at both ends and neither
+    end throws. Fine for cells holding only an image or a colour."""
+    out = []
+    for path in repo.lib:
+        text = repo.read(path)
+        for m in re.finditer(r"childAspectRatio:\s*([0-9.]+)\s*[,)]", text):
+            out.append(Finding(
+                "fixed-aspect", "WARN", repo.rel(path),
+                line_of(text, m.start()),
+                f"childAspectRatio: {m.group(1)} is a literal; if the cell "
+                "holds text, it clips on a phone or balloons on a tablet",
+            ))
+    return out
+
+
+def labelled_by_wrapper(text: str, pos: int) -> bool:
+    """Whether the widget at [pos] is the child of a `Semantics(label: ...)`
+    or a `Tooltip(...)` whose parentheses enclose it."""
+    for m in re.finditer(r"\b(?:Semantics|Tooltip)\s*\(",
+                         text[max(0, pos - 300):pos]):
+        start = max(0, pos - 300) + m.end() - 1
+        depth, j = 0, start
+        while j < len(text):
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j > pos and re.search(r"\b(?:label|message)\s*:",
+                                 text[start:pos]):
+            return True
+    return False
+
+
+def check_icon_labels(repo: Repo) -> List[Finding]:
+    """An icon-only button with no tooltip has no accessible name.
+
+    The lookbehind skips wrappers like `AppIconButton(`: a codebase that fixed
+    this properly has one wrapper requiring a label, and reporting every call
+    site of the fix teaches people to skim the whole category. The wrapper's
+    own `IconButton(` is still checked.
     """
     out = []
     for path in repo.lib:
         text = repo.read(path)
-        if "disableAnimations" in text:
-            continue
-        for i, line in enumerate(text.splitlines(), 1):
-            if re.search(r"\.repeat\s*\(", line) or "repeat(reverse:" in line:
-                out.append(Finding(
-                    "reduce-motion", "WARN", repo.rel(path), i,
-                    "a looping animation in a file that never checks "
-                    "MediaQuery.disableAnimations",
-                ))
-                break
-    return out
-
-
-def check_icon_labels(repo: Repo) -> list[Finding]:
-    """An icon-only button with no tooltip has no accessible name."""
-    out = []
-    for path in repo.lib:
-        text = repo.read(path)
-        # `IconButton.styleFrom(` is a style, not a button. Matching it was
-        # this check's first false positive.
-        #
-        # The lookbehind is the second: without it this matches the *call
-        # sites* of any wrapper named `_IconButton` or `AppIconButton`, which
-        # is precisely the shape a codebase takes once it has fixed this
-        # finding properly — one wrapper that requires a label, used
-        # everywhere. So the check reported a fault at every use of the fix for
-        # it, and a check that fires on the correct answer is worse than none,
-        # because it teaches people to skim past this whole category. The
-        # wrapper's own definition still contains a bare `IconButton(` and is
-        # still checked, which is where the tooltip belongs anyway.
         for match in re.finditer(
-                r"(?<![\w$])IconButton(?!\.styleFrom)(\.\w+)?\s*\(",
-                text):
-            # Scan forward to the matching close paren, crudely but adequately.
+                r"(?<![\w$])IconButton(?!\.styleFrom)(\.\w+)?\s*\(", text):
             depth, j = 0, match.end() - 1
             while j < len(text):
                 if text[j] == "(":
@@ -127,110 +254,96 @@ def check_icon_labels(repo: Repo) -> list[Finding]:
                         break
                 j += 1
             body = text[match.end():j]
-            if "tooltip:" in body or "Semantics" in body:
+            if re.search(r"\b(?:tooltip|semanticLabel)\s*:", body) or \
+                    "Semantics(" in body or \
+                    labelled_by_wrapper(text, match.start()):
                 continue
-            line = text.count("\n", 0, match.start()) + 1
             out.append(Finding(
-                "icon-label", "WARN", repo.rel(path), line,
-                "IconButton with no tooltip: — nothing to announce and no "
-                "long-press hint",
+                "icon-label", "WARN", repo.rel(path),
+                line_of(text, match.start()),
+                "IconButton with no tooltip: nothing for a screen reader to "
+                "announce and no long-press hint",
             ))
     return out
 
 
-def check_fixed_aspect(repo: Repo) -> list[Finding]:
-    """A fixed childAspectRatio ties height to width. Text wrapping unties it.
+def check_haptics_switch(repo: Repo) -> List[Finding]:
+    """Haptics a user cannot turn off.
 
-    Wider cells wrap text into *fewer* lines and need *less* height; a ratio
-    says the opposite. It is wrong at both ends — cavernous tiles on a tablet,
-    clipped text on a small phone — and neither end throws.
+    Flutter's `HapticFeedback` already obeys the system setting (iOS System
+    Haptics, Android Touch feedback), so on its own it only earns a NOTE for
+    a game that buzzes often. A vibration plugin calls the vibrator directly
+    and ignores that setting, so without an in-app switch it is a WARN.
     """
-    out = []
+    plugin_use: Optional[str] = None
+    haptic_use: Optional[str] = None
+    has_switch = False
     for path in repo.lib:
         text = repo.read(path)
-        for i, line in enumerate(text.splitlines(), 1):
-            m = re.search(r"childAspectRatio:\s*([0-9.]+)\s*,", line)
-            if m:
-                out.append(Finding(
-                    "fixed-aspect", "WARN", repo.rel(path), i,
-                    f"childAspectRatio: {m.group(1)} is a literal — cell "
-                    "height is tied to width, but text wrapping is not",
-                ))
-    return out
-
-
-def check_content_cap(repo: Repo) -> list[Finding]:
-    """A max-width above the narrowest tablet never engages on a tablet.
-
-    The subtlety that cost a false positive on the first run: a *wide* cap is
-    perfectly legitimate for a two-pane layout that only exists in landscape.
-    What is not legitimate is having no narrow one — that is the shape where
-    every list in the app runs edge to edge while the code looks handled.
-    """
-    pattern = re.compile(
-        r"(?:static\s+)?const\s+\w*(?:maxWidth|MaxWidth|contentWidth|"
-        r"ContentWidth|readableWidth)\w*\s*=\s*([0-9]+(?:\.[0-9]+)?)"
-    )
-    caps: list[tuple[Path, int, float]] = []
-    for path in repo.lib:
-        for i, line in enumerate(repo.read(path).splitlines(), 1):
-            m = pattern.search(line)
-            if m:
-                caps.append((path, i, float(m.group(1))))
-
-    if not caps:
-        return []
-    if any(value <= NARROWEST_TABLET for _, _, value in caps):
-        # There is a usable cap. Anything wider is presumed to be a deliberate
-        # two-pane one, which is a judgement call rather than a fault.
-        return []
-    path, line, value = min(caps, key=lambda c: c[2])
-    return [Finding(
-        "content-cap", "FAIL", repo.rel(path), line,
-        f"the narrowest content cap is {value:g}, which never engages on any "
-        f"tablet in portrait (narrowest is {NARROWEST_TABLET}pt) — every list "
-        "runs edge to edge on every tablet",
-    )]
-
-
-def check_haptics_switch(repo: Repo) -> list[Finding]:
-    """Haptics people cannot turn off are haptics people uninstall over."""
-    uses, has_switch = None, False
-    for path in repo.lib:
-        text = repo.read(path)
-        if "HapticFeedback." in text and uses is None:
-            uses = repo.rel(path)
-        if re.search(r"haptic|vibrat", text, re.I) and re.search(
-            r"Switch|setHaptic|hapticsEnabled", text
-        ):
+        if plugin_use is None and re.search(
+                r"\b(?:Vibration|Vibrate|Haptics)\.\w+\s*\(", text):
+            plugin_use = repo.rel(path)
+        if haptic_use is None and "HapticFeedback." in text:
+            haptic_use = repo.rel(path)
+        if re.search(r"haptic|vibrat", text, re.I) and (
+                re.search(r"\b(?:Switch|SwitchListTile|CupertinoSwitch|"
+                          r"Checkbox|CheckboxListTile)\b", text) or
+                re.search(r"(?i:set\w*(?:haptic|vibrat))|"
+                          r"(?i:haptic|vibrat)\w*(?:Enabled|On)\b", text)):
             has_switch = True
-    if uses and not has_switch:
+    if has_switch:
+        return []
+    if plugin_use:
         return [Finding(
-            "haptics-switch", "WARN", uses, 1,
-            "the app buzzes and offers no way to stop it",
+            "haptics-switch", "WARN", plugin_use, 1,
+            "a vibration plugin bypasses the system haptics setting and the "
+            "app has no switch of its own",
+        )]
+    if haptic_use:
+        return [Finding(
+            "haptics-switch", "NOTE", haptic_use, 1,
+            "HapticFeedback obeys the system switch, so this is fine unless "
+            "the app buzzes often; a game that does should offer its own",
         )]
     return []
 
 
-def check_test_coverage(repo: Repo) -> list[Finding]:
-    """The two surfaces a suite silently never renders at."""
+def logical_sizes(text: str) -> List[float]:
+    """Shortest sides of every size a test file renders at, in logical px.
+
+    `physicalSize` is in device pixels: divided by the file's
+    `devicePixelRatio`, or by 3.0, the flutter_test default, if unset.
+    """
+    dpr_m = re.search(r"devicePixelRatio\w*\s*=\s*([0-9.]+)", text)
+    dpr = float(dpr_m.group(1)) if dpr_m else 3.0
     out = []
-    joined = "\n".join(repo.read(p) for p in repo.tests)
-    if not repo.tests:
-        return out
-    if "textScaler" not in joined and "textScaleFactor" not in joined:
+    for m in re.finditer(
+            r"\b(?:Size|Vector2)\s*\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\)", text):
+        side = min(float(m.group(1)), float(m.group(2)))
+        if "physicalSize" in text[max(0, m.start() - 60):m.start()]:
+            side /= dpr
+        out.append(side)
+    return out
+
+
+def check_test_coverage(repo: Repo) -> List[Finding]:
+    """The two settings a suite most often never renders at."""
+    out = []
+    texts = [repo.read(p) for p in repo.tests]
+    joined = "\n".join(texts)
+    if not re.search(r"textScaler|textScaleFactor", joined):
         out.append(Finding(
             "untested-scale", "WARN", "test/", 1,
-            "no test sets a text scale — Dynamic Type reaches 3.1x and "
-            "layouts commonly break at 1.35x, one notch up the iOS slider",
+            "no test sets a text scale; iOS Dynamic Type reaches about 3.1x "
+            "and layouts commonly break at 1.35x, one notch up the slider",
         ))
-    tablet = re.search(r"\b(7[4-9][0-9]|8[0-9][0-9]|9[0-9][0-9]|1[0-9]{3})\b",
-                       joined)
-    if not tablet and "iPad" not in joined:
+    tablet = any(s >= TABLET_SHORTEST_SIDE
+                 for t in texts for s in logical_sizes(t))
+    if not tablet and not re.search(r"ipad|tablet", joined, re.I):
         out.append(Finding(
             "untested-tablet", "WARN", "test/", 1,
-            "no test renders at a tablet width — a stretched phone layout "
-            "is invisible from a phone",
+            "no test renders at a tablet size (shortest side >= 600); a "
+            "stretched phone layout is invisible from a phone",
         ))
     return out
 
@@ -241,55 +354,71 @@ CHECKS = [
     ("fixed-aspect", check_fixed_aspect),
     ("icon-label", check_icon_labels),
     ("haptics-switch", check_haptics_switch),
-    ("test-coverage", check_test_coverage),
+    ("untested-scale / untested-tablet", check_test_coverage),
 ]
 
-GREEN, YELLOW, RED, DIM, OFF = (
-    "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
-)
+COLOUR = {"FAIL": "\033[31m", "WARN": "\033[33m", "NOTE": "\033[2m"}
+GREEN, DIM, OFF = "\033[32m", "\033[2m", "\033[0m"
+RANK = {"FAIL": 0, "WARN": 1, "NOTE": 2}
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--app", default=".", help="app directory (default: .)")
-    ap.add_argument("--json", action="store_true")
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--app", default=".",
+                    help="Flutter project or monorepo root (default: .)")
+    ap.add_argument("--json", action="store_true",
+                    help="print findings as a JSON array")
     ap.add_argument("--strict", action="store_true",
-                    help="exit non-zero on any finding")
+                    help="exit 1 if anything is reported (after --quiet)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="hide NOTE-level findings")
     args = ap.parse_args()
 
     root = Path(args.app).resolve()
+    if not root.is_dir():
+        print(f"not a directory: {root}", file=sys.stderr)
+        return 2
     repo = Repo.load(root)
-
-    findings: list[Finding] = []
-    for _, fn in CHECKS:
-        findings += fn(repo)
+    if not repo.lib:
+        print(f"no Dart sources under a lib/ directory in {root}",
+              file=sys.stderr)
+        findings: List[Finding] = []
+    else:
+        findings = [f for _, fn in CHECKS for f in fn(repo)]
+    if args.quiet:
+        findings = [f for f in findings if f.level != "NOTE"]
+    code = 1 if (args.strict and findings) else 0
 
     if args.json:
-        print(json.dumps([f.__dict__ for f in findings], indent=2))
-        return 1 if (args.strict and findings) else 0
+        print(json.dumps([asdict(f) for f in findings], indent=2))
+        return code
 
-    print(f"Polish — {root.name}")
-    print(f"  {len(repo.lib)} source file(s), {len(repo.tests)} test file(s)\n")
+    tty = sys.stdout.isatty()
 
+    def c(colour: str, s: str) -> str:
+        return f"{colour}{s}{OFF}" if tty else s
+
+    print(f"Polish: {root.name}")
+    print(f"  {len(repo.lib)} source file(s), {len(repo.tests)} test "
+          "file(s)\n")
     if not findings:
-        print(f"  {GREEN}✓{OFF} Nothing the static checks can see.")
-    else:
-        by_check: dict[str, list[Finding]] = {}
-        for f in findings:
-            by_check.setdefault(f.check, []).append(f)
-        for check, group in by_check.items():
-            colour = RED if group[0].level == "FAIL" else YELLOW
-            print(f"  {colour}{group[0].level}{OFF}  {check}"
-                  f"  ({len(group)})")
-            for f in group[:8]:
-                print(f"        {DIM}{f.path}:{f.line}{OFF}  {f.message}")
-            if len(group) > 8:
-                print(f"        {DIM}… and {len(group) - 8} more{OFF}")
-            print()
-
-    print(f"\n{DIM}These are the mechanical ones. The ones that matter most "
-          f"need a screenshot — see SKILL.md.{OFF}")
-    return 1 if (args.strict and findings) else 0
+        print(f"  {c(GREEN, 'OK')}  nothing the static checks can see.")
+    groups: Dict[str, List[Finding]] = {}
+    for f in sorted(findings, key=lambda f: RANK[f.level]):
+        groups.setdefault(f.check, []).append(f)
+    for check, group in groups.items():
+        level = group[0].level
+        print(f"  {c(COLOUR[level], level)}  {check}  ({len(group)})")
+        for f in group[:8]:
+            print(f"        {c(DIM, f'{f.path}:{f.line}')}  {f.message}")
+        if len(group) > 8:
+            print(c(DIM, f"        ... and {len(group) - 8} more"))
+        print()
+    print(c(DIM, "These are the mechanical ones. The ones that matter most "
+                 "need a screenshot: see SKILL.md."))
+    return code
 
 
 if __name__ == "__main__":
