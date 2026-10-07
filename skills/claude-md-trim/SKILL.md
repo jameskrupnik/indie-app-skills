@@ -17,8 +17,8 @@ What the official docs say: a CLAUDE.md is loaded in full up to 4 MiB and skippe
 above that; files under ~200 lines are followed better; `@path` imports load at
 launch and so do not reduce anything. Reports that the end of an oversized file is
 silently cut are not confirmed by the docs — treat the warning as a cost warning,
-not a truncation notice, and do not tell the user rules are "being cut off" unless
-you have seen it happen.
+not a truncation notice, and never claim rules are "being cut off" unless you have
+seen it happen.
 
 The fix is never "delete the least important paragraph". It is **a split along
 the seam these files already have**: a rule, and the evidence it was decided on.
