@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure how much one Flutter app shares with its sibling apps.
+"""Measure how much one Flutter, React Native or Expo app shares with its siblings.
 
 App Store guideline 4.3(a) rejects apps that share "the same source code or
 assets" with apps already submitted and differ only in minor ways, and it names
@@ -7,13 +7,17 @@ assets" with apps already submitted and differ only in minor ways, and it names
 not one: a clean source number proves nothing while two apps ship the same
 description, screenshot or sound effect.
 
-  source       non-generated Dart, matched by relative path, near-dupes count
-  metadata     fastlane store listing text (.txt), matched by relative path
+  source       non-generated Dart (Flutter) or TS/JS (React Native, Expo),
+               matched by relative path, near-dupes count
+  metadata     fastlane store listing text (.txt), and an Expo app's EAS
+               Metadata store.config.json, matched by relative path
   screenshots  fastlane store images, byte-identical, matched on content
   assets       bundled audio/fonts/images/icons, byte-identical, on content
 
 Siblings are the directories next to the app (or under --root) that contain a
-pubspec.yaml. Standard library only; Python 3.9+.
+pubspec.yaml or a package.json naming react-native, whichever stack the app
+itself is: a store reviewer compares listings and assets, not frameworks.
+Standard library only; Python 3.9+.
 
 Exit codes: 0 all clear, 1 over threshold or a byte-identical file on a
 non-source surface, 2 usage error (bad path, no siblings).
@@ -43,6 +47,11 @@ ALWAYS_SKIP = {'build', '.dart_tool', '.git', '.symlinks', 'Pods',
 PLATFORM_DIRS = {'ios', 'android', 'macos', 'windows', 'linux', 'web'}
 GENERATED_DART = ('.g.dart', '.freezed.dart', '.config.dart', '.gr.dart',
                   '.mocks.dart')
+# React Native / Expo source. Platform trees next to package.json are pruned
+# for the source surface, like Flutter's; `.d.ts` files are generated or typings.
+JS_SUFFIXES = ('.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs')
+JS_GENERATED = ('.d.ts',)
+JS_SKIP = {'dist', 'web-build', 'coverage', 'vendor'}
 
 # Where fastlane lives: one shared dir at the app root, or the per-platform
 # layout Flutter's deployment docs use. Override with --fastlane.
@@ -69,22 +78,59 @@ ASSET_SUFFIXES = ('.wav', '.mp3', '.ogg', '.m4a', '.aac', '.flac',
 # monorepo count), plus the generated launcher icon and launch image trees.
 ASSET_DIR_NAME = 'assets'
 PLATFORM_ASSET_DIRS = ('ios/Runner/Assets.xcassets', 'android/app/src/main/res')
+# React Native names the iOS target after the app, so its catalogs are found
+# by pattern (ios/<App>/Images.xcassets).
+RN_PLATFORM_ASSET_GLOBS = ('ios/*/*.xcassets', 'android/app/src/main/res')
 # Xcode asset-catalog manifests. The icon and splash generators write them, so
 # they are identical across apps because the tools are. Same for fastlane's
 # Framefile.json, which is not a .txt and so never reaches the metadata set.
 ASSET_EXCLUDE_NAME = {'contents.json'}
 
 
+def is_rn(app: pathlib.Path) -> bool:
+    """A package.json naming react-native, and no pubspec.yaml (which wins)."""
+    if (app / 'pubspec.yaml').exists():
+        return False
+    try:
+        pkg = json.loads((app / 'package.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return False
+    deps = {**(pkg.get('dependencies') or {}), **(pkg.get('devDependencies') or {})}
+    return 'react-native' in deps
+
+
+def stack_of(app: pathlib.Path) -> str:
+    if (app / 'pubspec.yaml').exists():
+        return 'flutter'
+    if not is_rn(app):
+        return ''
+    try:
+        app_json = json.loads((app / 'app.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        app_json = {}
+    pkg = (app / 'package.json').read_text(encoding='utf-8', errors='ignore')
+    if ('"expo"' in pkg or 'expo' in app_json
+            or (app / 'app.config.js').exists() or (app / 'app.config.ts').exists()):
+        return 'expo'
+    return 'react-native'
+
+
+def is_app(d: pathlib.Path) -> bool:
+    return (d / 'pubspec.yaml').exists() or is_rn(d)
+
+
 def _walk(top: pathlib.Path, suffixes: tuple[str, ...],
-          prune_platform: bool = False):
+          prune_platform: bool = False, root_marker: str = 'pubspec.yaml',
+          extra_skip: frozenset = frozenset()):
     """Yield files under [top] ending in [suffixes], pruning junk directories."""
     if not top.is_dir():
         return
     for dirpath, dirnames, filenames in os.walk(top):
-        at_package_root = prune_platform and 'pubspec.yaml' in filenames
+        at_package_root = prune_platform and root_marker in filenames
         dirnames[:] = [
             d for d in dirnames
             if d not in ALWAYS_SKIP and not d.startswith('.')
+            and d not in extra_skip
             and not (at_package_root and d in PLATFORM_DIRS)
         ]
         for name in filenames:
@@ -102,18 +148,88 @@ def _rel(app: pathlib.Path, files, ignore: list[str]) -> dict[str, pathlib.Path]
 
 
 def dart_files(app, cfg) -> dict[str, pathlib.Path]:
+    if is_rn(app):
+        return js_files(app, cfg)
     files = (f for f in _walk(app, ('.dart',), prune_platform=True)
              if not f.name.endswith(GENERATED_DART))
     return _rel(app, files, cfg.ignore)
+
+
+def js_files(app, cfg) -> dict[str, pathlib.Path]:
+    """TS/JS source of a React Native or Expo app: src/, app/ (expo-router),
+    root files like App.tsx; never node_modules, build output or ios/android."""
+    files = (f for f in _walk(app, JS_SUFFIXES, prune_platform=True,
+                              root_marker='package.json',
+                              extra_skip=frozenset(JS_SKIP))
+             if not f.name.endswith(JS_GENERATED))
+    return _rel(app, files, cfg.ignore)
+
+
+class StoreConfigText:
+    """One text field of an EAS Metadata store.config.json, read like a file."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.name = ''
+
+    def read_text(self, encoding='utf-8'):
+        return self.text
+
+    def read_bytes(self):
+        return self.text.encode('utf-8')
+
+
+# EAS Metadata fields that are listing copy; title and URLs are left out for
+# the reasons META_EXCLUDE_* gives, and `review` like review_information/.
+STORE_CONFIG_FIELDS = {'subtitle': 'subtitle.txt', 'description': 'description.txt',
+                       'keywords': 'keywords.txt', 'releaseNotes': 'release_notes.txt',
+                       'promoText': 'promotional_text.txt'}
+STORE_CONFIG_PREFIX = 'store.config.json#'
+
+
+def store_config_files(app) -> dict[str, StoreConfigText]:
+    """Keyed `store.config.json#<locale>/<fastlane name>`, so canon() can
+    match them against a sibling's fastlane/metadata/<locale>/<name>."""
+    try:
+        data = json.loads((app / 'store.config.json').read_text(encoding='utf-8'))
+        info = (data.get('apple') or {}).get('info') or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    out = {}
+    for locale, fields in sorted(info.items()):
+        if not isinstance(fields, dict):
+            continue
+        for key, fname in STORE_CONFIG_FIELDS.items():
+            v = fields.get(key)
+            if isinstance(v, list):
+                v = ','.join(str(x) for x in v)
+            if isinstance(v, str) and v.strip():
+                out[f'{STORE_CONFIG_PREFIX}{locale}/{fname}'] = StoreConfigText(v)
+    return out
+
+
+def canon(rel: str) -> str:
+    """Match key for a metadata file: EAS Metadata fields compare as the
+    fastlane deliver file they correspond to. Identity for everything else."""
+    if rel.startswith(STORE_CONFIG_PREFIX):
+        return 'fastlane/metadata/' + rel[len(STORE_CONFIG_PREFIX):]
+    return rel
 
 
 def meta_files(app, cfg) -> dict[str, pathlib.Path]:
     """Store listing copy a reviewer reads as a description of this app."""
     files = (f for d in cfg.fastlane for f in _walk(app / d / 'metadata', ('.txt',)))
     out = _rel(app, files, cfg.ignore)
-    return {k: v for k, v in out.items()
-            if not any(x in k.lower() for x in META_EXCLUDE_PATH)
-            and v.name.lower() not in META_EXCLUDE_NAME}
+    out = {k: v for k, v in out.items()
+           if not any(x in k.lower() for x in META_EXCLUDE_PATH)
+           and v.name.lower() not in META_EXCLUDE_NAME}
+    if is_rn(app):
+        have = {canon(k) for k in out}
+        for k, v in store_config_files(app).items():
+            if canon(k) not in have and not any(fnmatch.fnmatch(k, g)
+                                                for g in cfg.ignore):
+                out[k] = v
+    return out
 
 
 def image_files(app, cfg) -> dict[str, pathlib.Path]:
@@ -130,7 +246,11 @@ def asset_files(app, cfg) -> dict[str, pathlib.Path]:
     code: a template's branded launch image survives regeneration if the tool
     writes density buckets and never the file the launch XML actually loads.
     """
-    tops = [app / d for d in (*PLATFORM_ASSET_DIRS, *cfg.asset_dir)]
+    if is_rn(app):
+        tops = [p for g in RN_PLATFORM_ASSET_GLOBS for p in sorted(app.glob(g))]
+        tops += [app / d for d in cfg.asset_dir]
+    else:
+        tops = [app / d for d in (*PLATFORM_ASSET_DIRS, *cfg.asset_dir)]
     for dirpath, dirnames, _ in os.walk(app):
         dirnames[:] = [d for d in dirnames
                        if d not in ALWAYS_SKIP and not d.startswith('.')]
@@ -146,6 +266,24 @@ COLLECTORS = {'source': dart_files, 'metadata': meta_files,
               'screenshots': image_files, 'assets': asset_files}
 
 
+def rn_names(app: pathlib.Path) -> set[str]:
+    """package.json name, and app.json's expo name and slug."""
+    out: set[str] = set()
+    for f, keys in (('package.json', (('name',),)),
+                    ('app.json', (('expo', 'name'), ('expo', 'slug'), ('name',)))):
+        try:
+            data = json.loads((app / f).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        for path in keys:
+            v = data
+            for k in path:
+                v = v.get(k) if isinstance(v, dict) else None
+            if isinstance(v, str) and re.fullmatch(r'[\w\- ]+', v):
+                out.add(v.strip())
+    return out
+
+
 def pubspec_name(app: pathlib.Path) -> str | None:
     try:
         text = (app / 'pubspec.yaml').read_text(encoding='utf-8')
@@ -158,7 +296,10 @@ def pubspec_name(app: pathlib.Path) -> str | None:
 def name_tokens(app: pathlib.Path) -> set[str]:
     """Every spelling of this app's name that could appear in source or copy."""
     words: set[str] = set()
-    for base in filter(None, {pubspec_name(app), app.name}):
+    bases = {pubspec_name(app), app.name}
+    if is_rn(app):
+        bases |= rn_names(app)
+    for base in filter(None, bases):
         parts = [p for p in re.split(r'[-_\s]+', base) if p]
         words |= {base, ''.join(parts), '_'.join(parts), '-'.join(parts),
                   ' '.join(parts), *parts}
@@ -198,7 +339,8 @@ def bucket(path: str) -> str:
                 'routes', 'i18n', 'l10n', 'setup', 'injection', 'di', 'locator',
                 'main'}:
         return 'infrastructure'
-    if any(s in ('test', 'test_driver', 'integration_test', 'tool')
+    if any(s in ('test', 'test_driver', 'integration_test', 'tool',
+                 '__tests__', '__mocks__')
            for s in segs[:-1]):
         return 'infrastructure'
     if words & {'bloc', 'blocs', 'cubit', 'cubits', 'screen', 'screens',
@@ -211,8 +353,9 @@ def bucket(path: str) -> str:
 
 def compare_text(mine, theirs, norm, near: float) -> list[dict]:
     shared = []
+    theirs = {canon(k): v for k, v in theirs.items()}
     for rel, path in mine.items():
-        twin = theirs.get(rel)
+        twin = theirs.get(canon(rel))
         if twin is None:
             continue
         try:
@@ -289,7 +432,7 @@ def find_siblings(app, root, only, exclude):
     for d in sorted(root.iterdir()):
         if not d.is_dir() or d.resolve() == app:
             continue
-        if not (d / 'pubspec.yaml').exists():
+        if not is_app(d):
             continue
         if only and d.name not in only:
             continue
@@ -314,7 +457,7 @@ def parse_args(argv=None):
     ap.add_argument('--sibling', action='append', default=[], metavar='NAME',
                     help='compare only against this sibling directory; '
                     'repeatable (default: every dir under --root with a '
-                    'pubspec.yaml)')
+                    'pubspec.yaml or a React Native package.json)')
     ap.add_argument('--exclude', action='append', default=[], metavar='GLOB',
                     help='skip sibling dirs whose name matches, e.g. '
                     '"*-webdemo" or a plugin package; repeatable')
@@ -355,9 +498,9 @@ def main(argv=None) -> int:
     # target, so a directory of symlinked apps works as a sibling set.
     root = pathlib.Path(os.path.abspath(args.root or
                                         os.path.join(args.app, os.pardir)))
-    if not (app / 'pubspec.yaml').is_file():
-        print(f'error: {app} has no pubspec.yaml — not a Dart/Flutter app',
-              file=sys.stderr)
+    if not is_app(app):
+        print(f'error: {app} has no pubspec.yaml or React Native package.json '
+              '— not a Flutter, React Native or Expo app', file=sys.stderr)
         return 2
     if not root.is_dir():
         print(f'error: --root {root} is not a directory', file=sys.stderr)
@@ -370,8 +513,8 @@ def main(argv=None) -> int:
 
     siblings = find_siblings(app, root, set(args.sibling), args.exclude)
     if not siblings:
-        print(f'error: no sibling apps with a pubspec.yaml under {root}',
-              file=sys.stderr)
+        print(f'error: no sibling apps with a pubspec.yaml or React Native '
+              f'package.json under {root}', file=sys.stderr)
         return 2
 
     mine_files = {s: COLLECTORS[s](app, args) for s in args.surfaces}
@@ -397,7 +540,8 @@ def main(argv=None) -> int:
 
     if args.json:
         print(json.dumps({
-            'app': app.name, 'root': str(root), 'threshold': args.threshold,
+            'app': app.name, 'stack': stack_of(app), 'root': str(root),
+            'threshold': args.threshold,
             'aliases': args.alias, 'ignored': args.ignore,
             'siblings': [s.name for s in siblings],
             'surfaces': {s: {

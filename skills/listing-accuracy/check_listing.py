@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check a Flutter app's store listing against the app it describes.
+"""Check a Flutter, React Native or Expo app's store listing against the app.
 
 The failure this catches is a sentence that reads perfectly and is false: a
 listing naming a mode that was deleted, promising there are no adverts of a
@@ -10,23 +10,35 @@ compares the two, and the reviewer reads the listing before opening the app.
 Assumed layout (fastlane's own): listing text in `metadata/` under any of
 `fastlane/`, `ios/fastlane/` or `android/fastlane/`, one directory per locale
 (`metadata/en-US/`, `metadata/android/en-US/`, `metadata/ios/en-US/` all
-work), plus `review_information/notes.txt`. App code is every `.dart` file
-under a `lib/` directory (so `lib/` and `packages/*/lib/` both count), minus
-generated files. App strings also include `.arb`, slang `.i18n.json`/`.yaml`
-and text files under `assets/`.
+work), plus `review_information/notes.txt`. An Expo app's EAS Metadata file
+(`store.config.json`, App Store only) is read too.
+
+Flutter (pubspec.yaml): app code is every `.dart` file under a `lib/`
+directory (so `lib/` and `packages/*/lib/` both count), minus generated files.
+App strings also include `.arb`, slang `.i18n.json`/`.yaml` and text files
+under `assets/`.
+
+React Native / Expo (package.json naming react-native): app code is every
+`.ts`, `.tsx`, `.js` and `.jsx` file outside node_modules, build output,
+.expo, android/, ios/ and tests (so `src/`, expo-router's `app/` and a root
+`App.tsx` all count). App strings also include `.json` under a directory named
+i18n, locales, translations or lang, and text files under `assets/`.
 
 Exit codes: 0 no FAIL (warnings allowed), 1 at least one FAIL, 2 nothing to
-check (no listing files or no Dart sources).
+check (no listing files or no app sources).
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import bisect
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -106,6 +118,8 @@ CAPABILITY_CLAIMS = [
         # that it exists, and is usually written right beside a disclosure.
         "denies": [r"no rewarded (video|ad)", r"never .{0,20}rewarded"],
         "code": [r"\bRewarded(Interstitial)?Ad\b"],
+        # React Native only (react-native-google-mobile-ads hooks).
+        "code_rn": [r"\buseRewarded(Interstitial)?Ad\b"],
         # **A rewarded unit that exists only as Google's public sample id is
         # not shipped.** An app can carry the whole implementation with blank
         # production unit ids; the service reads blank as "no ads" and the
@@ -128,6 +142,9 @@ CAPABILITY_CLAIMS = [
                    r"no subscription", r"free, with no .{0,20}purchase"],
         "code": [r"\bbuy(Non)?Consumable\b", r"\bqueryProductDetails\b",
                  r"\bpurchase(Package|StoreProduct|Product)\b"],
+        # react-native-iap / expo-iap; RevenueCat is covered by `code`.
+        "code_rn": [r"\brequestPurchase\b", r"\brequestSubscription\b",
+                    r"\buseIAP\b"],
         # **A capability behind a compile-time false flag is not shipped.**
         # Match the gate, not the implementation. Adapt to your flag's name.
         "absent_if": [r"(?i)\b\w*(selling|purchases?|iap)\w*\s*=\s*false\b"],
@@ -142,12 +159,16 @@ CAPABILITY_CLAIMS = [
 ],
         "code": [r"\bBannerAd\b", r"\bInterstitialAd\b", r"\bNativeAd\b",
                  r"package:google_mobile_ads/"],
+        "code_rn": [r"\buse(Interstitial|AppOpen)Ad\b",
+                    r"['\"]react-native-google-mobile-ads['\"]"],
     },
     {
         "name": "accounts or sign-in",
         "asserts": [r"\bsign in\b", r"\bsign-in\b", r"\bcreate an account\b", r"\blog in\b"],
         "denies": [r"no account", r"no sign-?in", r"nothing to sign"],
         "code": [r"signInWith(?!Anonymously)", r"\bcreateUserWith", r"\bGoogleSignIn\b"],
+        # @react-native-google-signin spells it GoogleSignin; expo-apple-authentication.
+        "code_rn": [r"\bGoogleSignin\b", r"\bAppleAuthentication\.signInAsync\b"],
     },
     {
         "name": "online or multi-device play",
@@ -161,6 +182,7 @@ CAPABILITY_CLAIMS = [
                    r"there is no network", r"not (a )?multiplayer"],
         "code": [r"\bNearby\w*\b", r"\bSocket\b", r"\bWebSocketChannel\b",
                  r"\bGKMatch\w*\b"],
+        "code_rn": [r"\bnew WebSocket\b", r"['\"]socket\.io-client['\"]"],
     },
     {
         "name": "leaderboards",
@@ -178,6 +200,16 @@ PRUNE = {"build", ".dart_tool", ".git", "Pods", "node_modules", ".gradle",
          ".symlinks", "ephemeral", ".fvm", "test", "integration_test",
          "test_driver", "fastlane", "docs"}
 STRING_SUFFIXES = (".arb", ".i18n.json", ".i18n.yaml", ".i18n.yml")
+# React Native / Expo.
+JS_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+JS_SKIP_SUFFIXES = (".d.ts", ".test.ts", ".test.tsx", ".test.js", ".test.jsx",
+                    ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx")
+JS_PRUNE = {"android", "ios", ".expo", "dist", "web-build", "coverage",
+            "__tests__", "__mocks__", "e2e", "vendor"}
+# Root config files: tooling, never app copy.
+JS_ROOT_SKIP = re.compile(r"^(babel|metro|jest|eslint|prettier|tailwind|webpack"
+                          r"|react-native|app|postcss)\.config\.|^\.")
+STRING_DIRS = {"i18n", "locales", "locale", "translations", "lang", "langs"}
 ASSET_TEXT_SUFFIXES = (".json", ".txt", ".md", ".yaml", ".yml", ".csv", ".arb")
 SENTINELS = r"(none|unknown|unset|empty|invalid|undefined)\b"
 MAX_ASSET_BYTES = 2_000_000
@@ -191,6 +223,10 @@ NUMBER_WORDS = {
     "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
     "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
 }
+
+# Display names for listing files that are not files of their own (fields
+# of store.config.json, written to temp files).
+LABELS: dict = {}
 
 failures: list[str] = []
 warnings: list[str] = []
@@ -209,12 +245,84 @@ def read(path: Path) -> str:
 # Finding files
 # ---------------------------------------------------------------------------
 
-def walk(app: Path):
+def walk(app: Path, extra_prune: frozenset = frozenset()):
     for root, dirs, files in os.walk(app):
         dirs[:] = [d for d in dirs if d not in PRUNE and not d.startswith(".")
-                   and not d.endswith("webdemo")]
+                   and not d.endswith("webdemo") and d not in extra_prune]
         for name in files:
             yield Path(root) / name
+
+
+def detect_stack(app: Path) -> str:
+    """"flutter", "react-native", "expo", or "" when neither is recognised.
+
+    pubspec.yaml wins, so a Flutter app with a package.json for tooling stays
+    Flutter.
+    """
+    if (app / "pubspec.yaml").is_file():
+        return "flutter"
+    try:
+        pkg = json.loads((app / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+    if "react-native" not in deps:
+        return ""
+    try:
+        app_json = json.loads((app / "app.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        app_json = {}
+    if ("expo" in deps or "expo" in app_json or (app / "app.config.js").is_file()
+            or (app / "app.config.ts").is_file()):
+        return "expo"
+    return "react-native"
+
+
+def store_config_files(app: Path, locale: str, tmp: Path) -> dict[Path, str]:
+    """EAS Metadata (store.config.json) text, as fastlane-named temp files.
+
+    EAS Metadata covers the App Store only. Each field is written to a file
+    named like fastlane's (subtitle.txt, keywords.txt...) so the name check
+    skips the same fields it skips for fastlane. Returns {temp path: label}.
+    """
+    candidates = [app / "store.config.json"]
+    try:
+        eas = json.loads((app / "eas.json").read_text(encoding="utf-8"))
+        for profile in eas.get("submit", {}).values():
+            mp = (profile.get("ios") or {}).get("metadataPath")
+            if mp and mp.endswith(".json"):
+                candidates.append(app / mp)
+    except (OSError, ValueError, AttributeError):
+        pass
+    fields = {"title": "title.txt", "subtitle": "subtitle.txt",
+              "description": "description.txt", "keywords": "keywords.txt",
+              "releaseNotes": "release_notes.txt",
+              "promoText": "promotional_text.txt"}
+    out: dict[Path, str] = {}
+    for cfg in dict.fromkeys(candidates):
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        apple = data.get("apple") or {}
+        info = (apple.get("info") or {}).get(locale) or {}
+        texts = {fields[k]: v for k, v in info.items() if k in fields}
+        notes = (apple.get("review") or {}).get("notes")
+        if notes:
+            texts["notes.txt"] = notes
+        for name, value in texts.items():
+            if isinstance(value, list):
+                value = ", ".join(str(v) for v in value)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            key = "review.notes" if name == "notes.txt" else f"info.{locale}." + next(
+                k for k, v in fields.items() if v == name)
+            sub = tmp / str(len(out))
+            sub.mkdir(parents=True, exist_ok=True)
+            path = sub / name
+            path.write_text(value, encoding="utf-8")
+            out[path] = f"{cfg.relative_to(app).as_posix()}#apple.{key}"
+    return out
 
 
 def metadata_roots(app: Path) -> list[Path]:
@@ -243,6 +351,51 @@ def listing_files(app: Path, locale: str) -> list[Path]:
             elif locale in parts or "default" in parts or "testflight" in parts:
                 found.append(path)
     return found
+
+
+def js_files(app: Path) -> list[Path]:
+    out = []
+    for p in walk(app, frozenset(JS_PRUNE)):
+        if not p.name.endswith(JS_SUFFIXES) or p.name.endswith(JS_SKIP_SUFFIXES):
+            continue
+        if p.parent == app and JS_ROOT_SKIP.search(p.name):
+            continue
+        out.append(p)
+    return out
+
+
+def strip_js_comments(source: str) -> str:
+    """Remove // and /* */ comments from TS/JS, leaving strings intact.
+
+    Same reason as the Dart version. Template literals are kept whole,
+    `${}` included; a regex literal containing `//` can lose the rest of its
+    line, which only ever hides code, never invents it.
+    """
+    out: list[str] = []
+    i, n = 0, len(source)
+    while i < n:
+        two = source[i:i + 2]
+        c = source[i]
+        if two == "//":
+            j = source.find("\n", i)
+            i = n if j < 0 else j
+        elif two == "/*":
+            j = source.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+        elif c in "'\"`":
+            j = i + 1
+            while j < n and source[j] != c:
+                if c != "`" and source[j] == "\n":
+                    break
+                j += 2 if source[j] == "\\" else 1
+            j = min(n, j + 1)
+            out.append(source[i:j])
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def dart_files(app: Path) -> list[Path]:
@@ -293,7 +446,7 @@ def strip_dart_comments(source: str) -> str:
     return "".join(out)
 
 
-def vocabulary(app: Path, sources: list[str]) -> list[str]:
+def vocabulary(app: Path, sources: list[str], stack: str = "flutter") -> list[str]:
     """Every word the app says or names, lowercased, sorted for prefix lookup.
 
     Identifiers are split on camelCase, so `NearbyLobbyView` contributes
@@ -302,9 +455,13 @@ def vocabulary(app: Path, sources: list[str]) -> list[str]:
     what get a check ignored.
     """
     parts = list(sources)
-    for path in walk(app):
+    rn = stack in ("react-native", "expo")
+    for path in walk(app, frozenset(JS_PRUNE) if rn else frozenset()):
         rel = path.relative_to(app).parts
-        if path.name.endswith(STRING_SUFFIXES) or (
+        if rn and path.suffix == ".json" and STRING_DIRS & set(rel[:-1]) and \
+                path.stat().st_size <= MAX_ASSET_BYTES:
+            parts.append(read(path))
+        elif path.name.endswith(STRING_SUFFIXES) or (
             "assets" in rel and path.name.endswith(ASSET_TEXT_SUFFIXES)
             and path.stat().st_size <= MAX_ASSET_BYTES
         ):
@@ -359,7 +516,8 @@ def check_names(files: list[Path], vocab: list[str], allow: set[str]) -> None:
                 words = [w for w in re.split(r"[^A-Za-z]+", raw) if w]
                 if any(w.lower() not in STOPWORDS and w.lower() not in allow
                        and not known(w, vocab) for w in words):
-                    unknown.setdefault(raw.strip(), set()).add(path.name)
+                    unknown.setdefault(raw.strip(), set()).add(
+                        LABELS.get(path, path.name))
 
     if not unknown:
         passes.append("Every name in the listing exists somewhere in the app")
@@ -394,14 +552,19 @@ def asserts_in(sentence: str, patterns: list[str]) -> bool:
     return False
 
 
-def check_capabilities(files: list[Path], code: str) -> None:
-    """Claims about adverts, purchases, accounts, online play, leaderboards."""
+def check_capabilities(files: list[Path], code: str, rn: bool = False) -> None:
+    """Claims about adverts, purchases, accounts, online play, leaderboards.
+
+    [rn] adds each claim's `code_rn` patterns (React Native library names) to
+    its `code` patterns.
+    """
     text = "\n\n".join(read(p) for p in files).lower().replace("’", "'")
     parts = sentences(text)
 
     clean = True
     for claim in CAPABILITY_CLAIMS:
-        implemented = any(re.search(p, code) for p in claim["code"])
+        patterns = claim["code"] + (claim.get("code_rn", []) if rn else [])
+        implemented = any(re.search(p, code) for p in patterns)
         gated = implemented and any(re.search(p, code) for p in claim.get("absent_if", []))
         present = implemented and not gated
         denied = any(re.search(p, s) for s in parts for p in claim["denies"])
@@ -529,14 +692,47 @@ def collection_counts(sources: list[str]) -> dict[str, int]:
     return counts
 
 
-def check_counts(files: list[Path], sources: list[str]) -> None:
+def js_collection_counts(sources: list[str]) -> dict[str, int]:
+    """TS/JS analogue of collection_counts.
+
+    - `enum Theme { A, B = 'b' }` -> "theme": 2.
+    - `const THEMES = [...]`, `const themes: Theme[] = [...]`,
+      `export const themes = [...] as const` -> "themes", counted as the
+      array's top-level items (object literals have their own commas, so
+      split at depth 0).
+
+    `const` only, for the same reason as the Dart version.
+    """
+    counts: dict[str, int] = {}
+    for source in sources:
+        for m in re.finditer(r"\benum\s+(\w+)\s*\{", source):
+            body = source[m.end():matching_close(source, m.end() - 1)]
+            members = [x for x in top_level_items(body)
+                       if re.match(r"[A-Za-z_]\w*\s*(=|$)", x, re.S)
+                       and not re.match(SENTINELS, x, re.I)]
+            if members:
+                counts.setdefault(m.group(1).lower(), len(members))
+        for m in re.finditer(
+            r"\bconst\s+(\w+)\s*(?::\s*[\w<>\[\]., |]+?)?\s*=\s*\[", source):
+            body = source[m.end():matching_close(source, m.end() - 1)]
+            items = top_level_items(body)
+            if len(items) < 2:
+                continue
+            name = re.sub(r"^_+", "", m.group(1))
+            if name.isupper():
+                name = name.replace("_", "")
+            counts.setdefault(name.lower(), len(items))
+    return counts
+
+
+def check_counts(files: list[Path], sources: list[str], rn: bool = False) -> None:
     """ "Twelve tables", "six themes" against the real lists and enums.
 
     Advisory rather than a failure: mapping a noun to a Dart list is a guess,
     and a guess that fails a build gets the check skipped. It is here because
     a stale count survives every test and drifts whenever content is added.
     """
-    counts = collection_counts(sources)
+    counts = js_collection_counts(sources) if rn else collection_counts(sources)
     if not counts:
         return
     text = "\n".join(read(p) for p in files)
@@ -588,7 +784,8 @@ def warn(msg: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--app", default=".", help="Flutter app directory (default: cwd)")
+    parser.add_argument("--app", default=".",
+                        help="Flutter, React Native or Expo app directory (default: cwd)")
     parser.add_argument("--locale", default="en-US",
                         help="listing locale directory to check (default: en-US)")
     parser.add_argument("--listing", action="append", default=[], metavar="FILE",
@@ -602,7 +799,16 @@ def main() -> int:
     args = parser.parse_args()
 
     app = Path(args.app).resolve()
+    stack = detect_stack(app)
+    rn = stack in ("react-native", "expo")
     files = listing_files(app, args.locale) + [Path(p) for p in args.listing]
+    labels: dict[Path, str] = {}
+    if rn:
+        tmp = Path(tempfile.mkdtemp(prefix="listing-accuracy-"))
+        atexit.register(shutil.rmtree, tmp, True)
+        labels = store_config_files(app, args.locale, tmp)
+        LABELS.update(labels)
+        files += list(labels)
     files = [p for p in files if p.is_file()]
 
     def stop(message: str) -> int:
@@ -615,23 +821,33 @@ def main() -> int:
 
     if not files:
         return stop(f"No {args.locale} listing files under {app}/"
-                    "{fastlane,ios/fastlane,android/fastlane}/metadata and no "
-                    "--listing given. Nothing was checked.")
-    paths = dart_files(app)
-    if not paths:
-        return stop(f"No Dart sources under a lib/ directory in {app}. "
-                    "Is this a Flutter app?")
+                    "{fastlane,ios/fastlane,android/fastlane}/metadata"
+                    + (" or store.config.json" if rn else "") +
+                    " and no --listing given. Nothing was checked.")
+    if rn:
+        paths = js_files(app)
+        if not paths:
+            return stop(f"No TypeScript or JavaScript sources in {app}. "
+                        "Is this a React Native app?")
+    else:
+        paths = dart_files(app)
+        if not paths:
+            return stop(f"No Dart sources under a lib/ directory in {app}. "
+                        "Is this a Flutter app?")
     sources = [read(p) for p in paths]
-    stripped = [strip_dart_comments(s) for s in sources]
+    strip = strip_js_comments if rn else strip_dart_comments
+    stripped = [strip(s) for s in sources]
 
-    check_names(files, vocabulary(app, sources), {w.lower() for w in args.allow})
-    check_capabilities(files, "\n".join(stripped))
-    check_counts(files, stripped)
+    check_names(files, vocabulary(app, sources, stack), {w.lower() for w in args.allow})
+    check_capabilities(files, "\n".join(stripped), rn)
+    check_counts(files, stripped, rn)
 
     if args.json:
-        print(json.dumps({"app": str(app), "files": [str(p) for p in files],
-                          "failures": failures, "warnings": warnings,
-                          "passes": passes}, indent=2))
+        out = {"app": str(app), "files": [labels.get(p, str(p)) for p in files],
+               "failures": failures, "warnings": warnings, "passes": passes}
+        if stack != "flutter":
+            out["stack"] = stack or "unknown"
+        print(json.dumps(out, indent=2))
         return 1 if failures else 0
 
     print(f"\nListing accuracy: {app.name} ({len(files)} listing file(s), {args.locale})\n")

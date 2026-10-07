@@ -8,15 +8,17 @@
 # upload — handing over a debug-signed or over-length release is worse than
 # handing over nothing.
 #
-# Run from the Flutter project root.
+# Run from the project root (Flutter, React Native or Expo).
 #
 # Usage:
 #   handoff.sh [options]
 #
 #   --app-id ID    Play Console app id        (or PLAY_APP_ID)
 #   --dev-id ID    Play Console developer id  (or PLAY_DEV_ID)
-#   --aab PATH     bundle to check and reveal
-#                  (default build/app/outputs/bundle/release/app-release.aab)
+#   --aab PATH     bundle to check and reveal (default: Flutter's
+#                  build/app/outputs/bundle/release/app-release.aab, or
+#                  android/app/build/outputs/... for React Native; pass an
+#                  EAS-built .aab here after downloading it)
 #   --dry-run      print what would be opened; open nothing (works anywhere)
 #   --force        open even if preflight fails
 #   -h, --help     this text
@@ -35,11 +37,16 @@
 
 set -uo pipefail
 
-usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 META="fastlane/metadata/android/en-US"
-AAB="build/app/outputs/bundle/release/app-release.aab"
+if [ ! -f pubspec.yaml ] && [ -f package.json ] \
+   && LC_ALL=C grep -q '"react-native"[[:space:]]*:' package.json; then
+  AAB="android/app/build/outputs/bundle/release/app-release.aab"
+else
+  AAB="build/app/outputs/bundle/release/app-release.aab"
+fi
 FORCE=0
 DRY=0
 

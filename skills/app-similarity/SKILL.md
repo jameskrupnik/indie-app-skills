@@ -1,6 +1,6 @@
 ---
 name: app-similarity
-description: Measure how much a Flutter app shares with its sibling apps (source, store listing text, screenshots and bundled assets like audio, fonts and icons) before submitting it to the App Store or Google Play. Use when about to submit, resubmit or fork an app that shares a template or code with other apps on the same developer account; when a rejection mentions guideline 4.3, 4.3(a), "spam", "similar binary", "repackaged template", "same source code or assets" or "minimum functionality"; or when asked how similar two apps are, whether an app is too close to another, or to check similarity, overlap or duplication across several apps.
+description: Measure how much a Flutter, React Native or Expo app shares with its sibling apps (source, store listing text, screenshots and bundled assets like audio, fonts and icons) before submitting it to the App Store or Google Play. Use when about to submit, resubmit or fork an app that shares a template or code with other apps on the same developer account; when a rejection mentions guideline 4.3, 4.3(a), "spam", "similar binary", "repackaged template", "same source code or assets" or "minimum functionality"; or when asked how similar two apps are, whether an app is too close to another, or to check similarity, overlap or duplication across several apps.
 ---
 
 # App similarity check
@@ -19,11 +19,15 @@ python3 ${CLAUDE_SKILL_DIR}/check_similarity.py --alias candy --alias fruit
 ```
 
 Run it from the app you are about to submit. Siblings are every directory next
-to it that has a `pubspec.yaml`. Standard library only, Python 3.9+.
+to it that has a `pubspec.yaml` or a `package.json` naming `react-native`,
+whatever the app's own stack: a reviewer compares listings and assets, not
+frameworks, so a React Native port of a Flutter app is measured against it.
+Standard library only, Python 3.9+.
 
 **Exit codes:** `0` clear; `1` any surface at or above the threshold (default
 **30%**), or any metadata, screenshot or asset file byte-identical to a
-sibling's; `2` usage error (no `pubspec.yaml`, bad `--root`, no siblings).
+sibling's; `2` usage error (no `pubspec.yaml` or React Native `package.json`,
+bad `--root`, no siblings).
 
 | Flag | Use |
 |---|---|
@@ -41,7 +45,8 @@ sibling's; `2` usage error (no `pubspec.yaml`, bad `--root`, no siblings).
 
 **Always pass `--alias` for the app's domain nouns** (the fruit, the taco, the
 pie) **and for the fork parent's** (the ball, the table). App names are
-normalised automatically from each `pubspec.yaml` and directory name, in every
+normalised automatically from each `pubspec.yaml` (or `package.json` name and
+`app.json` expo name/slug) and directory name, in every
 casing (`fruit_drop`, `FruitDrop`, `Fruit Drop`), but domain words are not. Two
 files identical except for `s/taco/candy/` count as *different* without them,
 which understates sharing — the direction that lets a bad app through.
@@ -52,13 +57,19 @@ siblings.
 
 ### What it assumes about layout
 
-- Each app is a directory with a `pubspec.yaml`, and siblings are the direct
-  children of one root. Nested layouts need `--root` pointed at the right level.
+- Each app is a directory with a `pubspec.yaml` or a React Native
+  `package.json`, and siblings are the direct children of one root. Nested layouts need `--root` pointed at the right level.
 - Store copy and screenshots are in fastlane's layout (`metadata/`,
   `screenshots/`, with Play images under `metadata/android/<locale>/images/`).
-  Without fastlane those two surfaces report `NOTHING TO COMPARE`.
+  An Expo app's EAS Metadata `store.config.json` (App Store fields) is read
+  too, each field compared as the fastlane file it corresponds to
+  (`description` as `metadata/<locale>/description.txt`), so a copied listing
+  is caught across the two layouts. Without either, those two surfaces report
+  `NOTHING TO COMPARE`.
 - Bundled assets are every directory named `assets` (monorepo packages
-  included), `ios/Runner/Assets.xcassets` and `android/app/src/main/res`.
+  included), `android/app/src/main/res`, and `ios/Runner/Assets.xcassets`
+  (Flutter) or `ios/<App>/*.xcassets` (React Native). A managed Expo app with
+  no `ios/`/`android/` is measured on `assets/` alone.
 
 ## The four surfaces, and why there are four
 
@@ -66,7 +77,9 @@ siblings.
 binary, **metadata**, and/or **concept**", so a clean source number proves
 nothing on its own.
 
-- **source** — non-generated Dart, matched by relative path; a file counts if
+- **source** — non-generated Dart (Flutter) or `.ts`/`.tsx`/`.js`/`.jsx`
+  (React Native, Expo: `src/`, expo-router's `app/`, root files like
+  `App.tsx`), matched by relative path; a file counts if
   it is identical after normalisation or at least `--near` the same.
 - **metadata** — store listing `.txt` under `fastlane/metadata`: subtitle,
   keywords, promotional text, description, release notes, TestFlight notes,
@@ -100,13 +113,17 @@ zero reads as "checked and clean" when nothing was checked.
 Excluding the wrong thing hides a real finding; excluding nothing buries it.
 
 - **source**: generated files (`*.g.dart`, `*.freezed.dart`, `*.config.dart`,
-  `*.gr.dart`, `*.mocks.dart`), platform directories next to a
-  `pubspec.yaml`, and `build/`, `.dart_tool/`, `Pods/`.
-- **metadata**: `review_information/` (contact details and review notes),
+  `*.gr.dart`, `*.mocks.dart`; `*.d.ts`), platform directories next to a
+  `pubspec.yaml` or `package.json`, and `build/`, `.dart_tool/`, `Pods/`,
+  `node_modules/`, `.expo/`, `dist/`. Across stacks the source surface is
+  always 0%: Dart and TypeScript never share a path.
+- **metadata**: `review_information/` (contact details and review notes; in
+  `store.config.json`, `apple.review`),
   `copyright.txt` and `*_url.txt`. One publisher's support address, privacy
   policy and marketing site are identical on every app they ship, for the same
   reason the logger is; left in, they put a permanent 33% on three URL files.
-- **metadata**: `title.txt` and `name.txt`, for a sharper reason — **the
+- **metadata**: `title.txt` and `name.txt` (and `store.config.json` titles),
+  for a sharper reason — **the
   normaliser makes them match unconditionally.** Their whole content is the
   app's name, which normalises to `X`, so any two titles read as identical.
   Compare titles by eye.
@@ -125,7 +142,7 @@ The percentage alone is not a decision. For source, the tool splits what is
 shared by path keywords:
 
 - **infrastructure** — logging, crash reporting, analytics, ads, DI, router,
-  i18n, `main.dart`, tests and tooling. Identical because it does an identical
+  i18n, `main.dart`, tests (`__tests__/` included) and tooling. Identical because it does an identical
   job. **Expected, and fine.** Two apps by one developer both having a crash
   reporter is not what 4.3 prohibits.
 - **app scaffolding** — blocs/cubits, screens, widgets, pages, models,

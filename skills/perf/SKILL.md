@@ -1,6 +1,6 @@
 ---
 name: perf
-description: Find and fix work that repeats every frame in a Flutter app or game (Flame, CustomPainter, custom canvas) — the cost a green suite and a clean analyze never mention — and measure the fix honestly. Use when asked to profile or improve performance, make an app or game faster or smoother, or reduce jank, stutter, dropped frames, battery drain or heat; when something "feels laggy" or "chugs" on an older phone; when reviewing a render, paint or update method; before shipping a game that draws its own canvas; or when asked whether an optimization actually helped, or to benchmark two versions of anything.
+description: Find and fix work that repeats every frame in a Flutter, React Native or Expo app or game (Flame, CustomPainter, react-native-skia, Reanimated worklets, requestAnimationFrame loops) and work redone on every React re-render — the cost a green suite and a clean analyze or tsc never mention — and measure the fix honestly. Use when asked to profile or improve performance, make an app or game faster or smoother, or reduce jank, stutter, dropped frames, battery drain or heat; when something "feels laggy" or "chugs" on an older phone; when reviewing a render, paint, update, frame-callback or component render method; before shipping a game that draws its own canvas; or when asked whether an optimization actually helped, or to benchmark two versions of anything.
 ---
 
 # Frame cost
@@ -22,7 +22,11 @@ python3 ${CLAUDE_SKILL_DIR}/check_perf.py --app .
 ```
 
 `--quiet` hides NOTEs, `--json` for a hook, `--strict` exits 1 on any
-finding, `--help` lists the checks.
+finding, `--help` lists the checks. The stack is detected (Dart under `lib/`,
+or a `package.json` depending on `react-native` or `expo`); `--stack
+flutter|rn` forces one. **React Native or Expo: read
+[React Native and Expo](#react-native-and-expo) below; the Flutter detail
+in between still explains the reasoning.**
 
 It finds per-frame methods first (`render(Canvas)`, `update(double)`,
 `paint(Canvas, Size)`) and reports only what is inside them, following
@@ -170,8 +174,67 @@ ones that render an empty box.
 6. Add a render test if there is none.
 7. Leave the probe in `tool/` with a note to re-run it.
 
+## React Native and Expo
+
+Same idea, two threads. Reanimated worklets, gestures and Skia pictures run
+on the **UI thread**; React renders, state and `runOnJS`/`scheduleOnRN`
+handlers on the **JS thread**. A frame drops when either misses it.
+
+The script treats as per-frame: `useFrameCallback`, `requestAnimationFrame`
+loops and any function taking an `SkCanvas` (certain); `useDerivedValue`,
+`useAnimatedStyle`, `useAnimatedProps`, `useAnimatedReaction` and
+`createPicture` (per frame only while a value they read animates, reported
+one level lower and tagged). It follows calls three levels, across files
+through relative and `tsconfig` alias imports, and skips
+`node_modules`, `build`, `.expo`, `Pods` and the native folders.
+
+| Fault | Check | The fix |
+|---|---|---|
+| **Skia objects built per frame** | `paint-per-frame`, `shader-per-frame`, `blur-per-frame`, `path-per-frame`, `color-parse-per-frame`, `text-layout-per-frame`, `decode-per-frame`, `save-layer-per-frame` | Build once (module scope, `useMemo`, or `cache ??= ...`) and mutate or transform it. A shader for a moving object can keep one gradient and move it with a local matrix |
+| **A JS hop every frame** | `js-roundtrip-per-frame` | `runOnJS`/`scheduleOnRN` only when something changed (the script accepts it behind an `if`); keep per-frame consumers on shared values |
+| **Logging in a hot path** | `console-per-frame` | Remove it. React Native's performance guide calls `console.*` "a big bottleneck" on the JS thread and recommends `babel-plugin-transform-remove-console` for production |
+| **State set in a rAF loop** | `setstate-per-frame` | A ref, an Animated/shared value, or `useFrameCallback`; render React state at most when the visible value changes |
+| **Garbage per frame** | `allocation-per-frame` | `.map`/`.filter`/spreads/`Object.keys` in a frame callback: reuse a scratch array, mutate in place (`sharedValue.modify`) |
+| **Memo defeated** | `inline-prop-to-memo` | An inline `{}`, `[]` or arrow passed to a `memo()` child is new every render; hoist it or `useMemo`/`useCallback` |
+| **Per-render work** | `stylesheet-in-render`, `heavy-in-render` | `StyleSheet.create` at module scope; sort/reduce/JSON in `useMemo` |
+| **Lists** | `list-in-scrollview`, `inline-render-item`, `index-key` | `FlatList` (or FlashList) for lists that grow; `renderItem` in `useCallback`; a stable key. `getItemLayout` when rows have a fixed height (both from React Native's list guide) |
+
+Not checked, and worth a look by hand: reading `sharedValue.value` on the JS
+thread (Reanimated's docs: it blocks until the UI thread answers), whole
+screens re-rendering from one context or store subscription, and images
+decoded at full resolution into small views.
+
+**Measure.** Static findings are where to point a measurement, not a work
+list, and the same rules apply: warm up, read the p95, believe a max only
+when it repeats, alternate the arms.
+
+- **Perf Monitor** (Dev Menu → *Show Perf Monitor*) shows the JS and UI
+  frame rates live. Quick, but a dev build: direction only.
+- **frame_probe.ts** logs frame intervals for both threads (UI via
+  `useFrameCallback`, JS via `requestAnimationFrame`), p50/p95/max per
+  window, first window discarded. Copy it into the app, call
+  `useFrameProbe('L01')` from the screen under test, and measure a release
+  build (`npx expo run:android --variant release`, `npx expo run:ios
+  --configuration Release`, or the bare-RN equivalent from Gradle/Xcode). Reanimated 4; on Reanimated 3 swap `scheduleOnRN` for
+  `runOnJS` as its header says.
+- **Flashlight** (Android) scores a real device run from the command line:
+  `flashlight measure` with the app open, or `flashlight test --bundleId
+  <id> --testCommand '<e2e command>' --resultsFilePath results.json` for
+  repeated runs, then `flashlight report results.json`.
+- **Platform profilers** for the why: React Native's profiling guide points
+  to the Android Studio Profiler (System Activities trace, exportable to
+  Perfetto) and Xcode Instruments. The standalone `systrace` tool has been
+  removed from Android platform-tools.
+
+`paired_bench.py` is stack-neutral: any `--probe` command that prints lines
+like `L01  ui 16.7/17.4/33.5` works, for example one that launches the
+release build, waits, and dumps the probe lines from `adb logcat -d -s
+ReactNativeJS`. The `--swap` script and the control metric are as above.
+
 For layout, text scale, tablets and Reduce Motion, use the `polish` skill;
 its faults hide from a green suite the same way.
+On React Native that skill covers Pressable labels and sizes, font scaling,
+safe areas and Reduce Motion the same way.
 
 ## Across several apps
 

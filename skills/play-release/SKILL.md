@@ -1,6 +1,6 @@
 ---
 name: play-release
-description: Get a Flutter app onto Google Play, and know in advance which steps a human has to do. Covers the order of Play Console declarations, pre-upload checks on the .aab (signing key, target SDK, advertising ID permission, store text and image limits, privacy policy, EEA ad consent), and the upload handoff. Use when releasing, submitting, publishing or shipping an Android app to Google Play or the Play Console; when building an .aab or app bundle, creating a production or internal testing release, or uploading a build; when filling Play declarations such as data safety, content rating (IARC), target audience, advertising ID, ads, health, financial or government apps; when "Send app for review" is greyed out or the setup checklist will not complete; when under-13 age groups are locked or the app is shown as rated "Teen"; when a bundle might be signed with the debug key; or when asked what still blocks a Play release.
+description: Get a Flutter, React Native or Expo app onto Google Play, and know in advance which steps a human has to do. Covers the order of Play Console declarations, pre-upload checks on the .aab (signing key, target SDK, advertising ID permission, store text and image limits, privacy policy, EEA ad consent), and the upload handoff. Use when releasing, submitting, publishing or shipping an Android app to Google Play or the Play Console; when building an .aab or app bundle, creating a production or internal testing release, or uploading a build; when filling Play declarations such as data safety, content rating (IARC), target audience, advertising ID, ads, health, financial or government apps; when "Send app for review" is greyed out or the setup checklist will not complete; when under-13 age groups are locked or the app is shown as rated "Teen"; when a bundle might be signed with the debug key; or when asked what still blocks a Play release.
 ---
 
 # Releasing to Google Play
@@ -9,12 +9,14 @@ description: Get a Flutter app onto Google Play, and know in advance which steps
 front: the order the declarations must be done in, and which steps a human
 has to do.** The console shows neither, and one of its messages misleads.
 
-**Assumed layout** (run the scripts from the Flutter project root):
+**Assumed layout** (run the scripts from the project root):
 
 ```
-pubspec.yaml
-android/key.properties                       # upload key config, not committed
-build/app/outputs/bundle/release/app-release.aab
+pubspec.yaml                                 # Flutter, or
+package.json                                 # React Native / Expo (names react-native)
+android/key.properties                       # Flutter upload key config, not committed
+build/app/outputs/bundle/release/app-release.aab           # Flutter default
+android/app/build/outputs/bundle/release/app-release.aab   # React Native default
 fastlane/metadata/android/<locale>/          # fastlane supply layout
   title.txt  short_description.txt  full_description.txt  privacy_url.txt
   changelogs/<versionCode>.txt | default.txt
@@ -23,7 +25,9 @@ fastlane/metadata/android/<locale>/          # fastlane supply layout
 ```
 
 The metadata tree is worth keeping even without fastlane: it versions the
-listing and lets the preflight check it. Deeper material (console failure
+listing and lets the preflight check it. An EAS-built bundle has no local
+default path: download it and pass it to the scripts. (EAS Metadata's
+`store.config.json` covers the App Store only, so Play copy still lives here.) Deeper material (console failure
 modes, browser-automation uploads, EEA consent implementation, rating
 examples, tablet capture) is in [reference.md](reference.md).
 
@@ -33,8 +37,12 @@ examples, tablet capture) is in [reference.md](reference.md).
    safety. Everything else (privacy policy, app access, ads, advertising ID,
    government, financial, health) in any order. [Why](#the-order-is-not-optional)
 2. **Build** with the production configuration stated explicitly:
-   `flutter build appbundle --release` plus whatever `--flavor` /
-   `--dart-define` your production build needs.
+   - Flutter: `flutter build appbundle --release` plus whatever `--flavor` /
+     `--dart-define` your production build needs.
+   - React Native: `cd android && ./gradlew bundleRelease`, with a release
+     `signingConfig` for your upload key (the template signs with debug).
+   - Expo: `eas build -p android --profile production`; EAS signs with the
+     keystore in `eas credentials`.
    [Why explicit](#the-build-configuration-cannot-be-checked-afterwards)
 3. **Preflight:** `${CLAUDE_SKILL_DIR}/preflight.sh` — fix every FAIL, read
    every warn. [What it checks](#preflight)
@@ -66,7 +74,8 @@ Which steps are manual depends on what you have:
 - **Driving the console with a browser-automation tool** (e.g. Claude in
   Chrome): the listing text and images can be done this way, but **the `.aab`
   cannot** if the tool's file upload is size-capped — Claude in Chrome's
-  `file_upload` caps at 10 MB and a Flutter bundle is typically 30-80 MB. That
+  `file_upload` caps at 10 MB and a Flutter bundle is typically 30-80 MB
+  (a React Native bundle is well over 10 MB as well). That
   upload is a human's. Technique in [reference.md](reference.md#uploading-through-browser-automation).
 
 **Human-only regardless of tooling:** accepting third-party terms (the IARC
@@ -111,13 +120,15 @@ from the developer first.
 
 If the app already applies child-directed ad treatment to every user
 (`TagForChildDirectedTreatment.yes`, `MaxAdContentRating.g`, non-personalised
-ads), **it has already given up personalised-ad revenue.** Declaring an
+ads; in React Native, `tagForChildDirectedTreatment: true` and
+`maxAdContentRating: MaxAdContentRating.G`), **it has already given up personalised-ad revenue.** Declaring an
 under-13 audience then costs little and removes the risk of a visibly
 child-appealing app claiming 13+.
 
 **Verify the flag reaches the SDK.** A constant that nothing passes to
-`MobileAds.instance.updateRequestConfiguration` is a promise the binary does
-not keep.
+`MobileAds.instance.updateRequestConfiguration` (Flutter) or
+`mobileAds().setRequestConfiguration` (React Native) is a promise the binary
+does not keep.
 
 - **Ads step:** "are all ads suitable for children and from certified
   networks?" AdMob is on Google's Families self-certified ads SDK list, so
@@ -127,7 +138,8 @@ not keep.
   into your app whether or not you list it. The Play declaration must match
   what is actually in the bundle — preflight reports which. Under the Families
   policy, apps aimed only at children must not transmit it (remove the
-  permission with `tools:node="remove"`); mixed-audience apps must not
+  permission with `tools:node="remove"`, or in Expo list it in
+  `android.blockedPermissions`); mixed-audience apps must not
   transmit it from children or users of unknown age.
 - **Teacher Approved** is offered inside the Target audience wizard. It is an
   opt-in programme that submits the app to outside reviewers — the
@@ -142,16 +154,19 @@ throughout.
 
 1. **A published European regulations message** — AdMob → Privacy &
    messaging → European regulations. Console config, no rebuild, provided the
-   app already calls the UMP SDK (`ConsentInformation.requestConsentInfoUpdate`).
-2. **An in-app entry point** that calls `ConsentForm.showPrivacyOptionsForm` —
-   code, and therefore a build.
+   app already calls the UMP SDK (`ConsentInformation.requestConsentInfoUpdate`;
+   in react-native-google-mobile-ads, `AdsConsent.requestInfoUpdate` or
+   `gatherConsent`).
+2. **An in-app entry point** that calls `ConsentForm.showPrivacyOptionsForm`
+   (`AdsConsent.showPrivacyOptionsForm`) — code, and therefore a build.
 
 **Ship them together.** The published message tells users to look for a
 link in the app to manage or withdraw consent; ship the message without the
 link and the consent form describes a control that does not exist.
 
-`preflight.sh` fails when `google_mobile_ads` is a dependency and either call
-is missing from the Dart sources. Implementation notes, the two settings that
+`preflight.sh` fails when `google_mobile_ads` (or
+`react-native-google-mobile-ads`) is a dependency and either call is missing
+from the Dart (or TS/JS) sources. Implementation notes, the two settings that
 block **Publish**, and how to test from outside the EEA are in
 [reference.md](reference.md#eea-consent-in-detail).
 
@@ -165,14 +180,15 @@ It checks what is silently wrong at upload time and no test catches:
 
 | Check | Why |
 |---|---|
-| Signer identity | The Flutter template **falls back to the debug key without a word** when `key.properties` is missing, and `jarsigner -verify` still says "jar verified". |
+| Signer identity | The Flutter template **falls back to the debug key without a word** when `key.properties` is missing, the React Native template signs release with the debug keystore outright, and `jarsigner -verify` still says "jar verified". |
 | `targetSdkVersion` (needs bundletool) | Play rejects new apps and updates below the current minimum (API 36 from 2026-08-31; override with `PLAY_MIN_TARGET_SDK`). |
 | `AD_ID` permission | Tells you what the Advertising ID declaration must say. Matches the full name, so `ACCESS_ADSERVICES_AD_ID` (Privacy Sandbox) is not mistaken for it. |
-| Package assets | Lists assets dependencies ship under `flutter_assets/packages/`, so another app's artwork riding in through a shared package gets seen. |
+| Package assets | Lists assets dependencies ship under `flutter_assets/packages/` (React Native: `node_modules_*` resources), so another app's artwork riding in through a shared package gets seen. |
 | Store text, every locale | Title 30, short 80, full 4000, release notes 500 — counted in characters, not bytes. |
 | Images | Icon 512x512, feature graphic 1024x500, screenshot counts, sizes and aspect (below). |
 | Privacy policy | `privacy_url.txt` must return 200. |
 | EEA consent | Both halves, as above. |
+| Project (React Native / Expo only) | Package and versionCode from `build.gradle` or `app.json`; a release `signingConfig` pointing at debug (FAIL without `eas.json`, since EAS injects its own signing); an `eas.json` production profile that builds an apk; AD_ID removed or not. |
 
 Needs `unzip` and a JDK's `jarsigner` (Android Studio's bundled JBR is found
 automatically). `bundletool` and `curl` are optional. Exit 1 on any failure.
@@ -181,7 +197,8 @@ automatically). `bundletool` and `curl` are optional. Exit 1 on any failure.
 
 **A staging build and a production build can be indistinguishable by
 inspection.** If your app picks ad unit ids, API hosts or keys at build time
-and both sets are compiled in as constants, both appear as strings in the
+(`--dart-define`, a flavor, `EXPO_PUBLIC_*` or `.env` values) and both sets
+are compiled in as constants, both appear as strings in the
 bundle whichever was selected. A staging build on a public track serves test
 ads (no revenue) or talks to the wrong backend. The only defence is to control
 the invocation: pass the production flags explicitly, and rebuild if unsure.
@@ -231,7 +248,8 @@ section counters and summaries, not the checkboxes. See
 ${CLAUDE_SKILL_DIR}/handoff.sh [--dry-run] [--force] [--aab PATH]
 ```
 
-Runs the preflight and, **only if it passes**, opens Finder at the images
+Runs the preflight and, **only if it passes** (pass `--aab` for an EAS-built
+bundle), opens Finder at the images
 folder, reveals the `.aab`, and opens three console tabs — store listing,
 production track, publishing overview — then prints the steps in order.
 `--dry-run` prints instead of opening and works on any OS. `--force` opens

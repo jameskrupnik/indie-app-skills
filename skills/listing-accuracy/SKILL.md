@@ -1,6 +1,6 @@
 ---
 name: listing-accuracy
-description: Check that a Flutter app's store listing describes the app that actually exists, before submitting or after changing what the app does. Compares fastlane metadata (description, subtitle, keywords, promotional text, release notes, Android changelogs, App Review notes) against the Dart code and strings, flagging feature names the app does not contain, ad/purchase/sign-in/online/leaderboard claims the code contradicts, and stale counts. Use when about to submit, resubmit or update an app on the App Store or Google Play; after adding, removing or renaming a feature, mode, screen or currency; when writing or reviewing description.txt, full_description.txt, keywords, promotional text, release notes or review notes; when a rejection cites guideline 2.3, "accurate metadata", "we were unable to locate" or "could not find the feature described"; or when asked whether the listing, store copy or review notes are still true.
+description: Check that a Flutter, React Native or Expo app's store listing describes the app that actually exists, before submitting or after changing what the app does. Compares fastlane metadata (description, subtitle, keywords, promotional text, release notes, Android changelogs, App Review notes) and Expo's store.config.json against the app's code and strings, flagging feature names the app does not contain, ad/purchase/sign-in/online/leaderboard claims the code contradicts, and stale counts. Use when about to submit, resubmit or update an app on the App Store or Google Play; after adding, removing or renaming a feature, mode, screen or currency; when writing or reviewing description.txt, full_description.txt, keywords, promotional text, release notes or review notes; when a rejection cites guideline 2.3, "accurate metadata", "we were unable to locate" or "could not find the feature described"; or when asked whether the listing, store copy or review notes are still true.
 ---
 
 # Listing accuracy
@@ -26,7 +26,7 @@ python3 ${CLAUDE_SKILL_DIR}/check_listing.py --json       # for a hook or CI
 
 Python 3.9+, stdlib only. Exit codes: **0** no FAIL (warnings allowed),
 **1** at least one FAIL, **2** nothing was checked (no listing files for that
-locale, or no Dart under a `lib/`). Other flags: `--listing FILE` for copy kept
+locale, or no app sources). Other flags: `--listing FILE` for copy kept
 outside fastlane, `--allow WORD` for a capitalised word that is not a feature
 name (a brand, a place). `--help` lists them.
 
@@ -35,9 +35,20 @@ name (a brand, a place). `--help` lists them.
 the chosen locale directory at any depth (`metadata/en-US/`,
 `metadata/android/en-US/changelogs/`, `metadata/ios/en-US/`), in `default/`,
 and `review_information/notes.txt`. URLs, copyright and reviewer contact files
-are skipped. The app side is every non-generated `.dart` under a `lib/`
-directory (so `lib/` and `packages/*/lib/`), plus `.arb`, slang `.i18n.*` and
-text files under `assets/`.
+are skipped. For an Expo app, EAS Metadata's `store.config.json` (App Store
+only) is read as well: `apple.info.<locale>` subtitle, description, keywords,
+release notes, promo text, and `apple.review.notes`.
+
+The app side depends on the stack, detected from the project root:
+
+- **Flutter** (`pubspec.yaml`): every non-generated `.dart` under a `lib/`
+  directory (so `lib/` and `packages/*/lib/`), plus `.arb`, slang `.i18n.*`
+  and text files under `assets/`.
+- **React Native / Expo** (`package.json` naming `react-native`): every
+  `.ts`/`.tsx`/`.js`/`.jsx` outside `node_modules/`, build output, `.expo/`,
+  `ios/`, `android/`, tests and root config files (so `src/`, expo-router's
+  `app/`, a root `App.tsx`), plus `.json` under a directory named `i18n`,
+  `locales`, `translations` or `lang`, and text files under `assets/`.
 
 ## What it checks
 
@@ -45,7 +56,7 @@ text files under `assets/`.
 |---|---|---|
 | Names | FAIL | A capitalised mid-sentence word or a "Quoted Name" that appears nowhere in the app's code, strings or assets |
 | Capabilities | FAIL / WARN | Rewarded video, in-app purchase, banner/interstitial ads, sign-in, online or multi-device play, leaderboards: claimed-but-absent, denied-but-present, or present-but-undisclosed |
-| Counts | WARN | "twelve tables", "six themes" against `const` lists and enums whose name matches the noun |
+| Counts | WARN | "twelve tables", "six themes" against `const` lists and enums whose name matches the noun (TS: `const THEMES = [...]` items, `enum` members) |
 
 Title, name, subtitle, keywords and promotional text are skipped by the name
 check only, because title case there is branding. The name check is
@@ -115,8 +126,13 @@ It compares words to code. It cannot tell whether a true sentence is the
   judgement about what to include, not a fact to verify.
 - **Capabilities outside its table.** Anything else you added and described
   nowhere, only reading finds.
-- **Ad unit ids from outside Dart.** With `--dart-define` or a config file,
-  the rewarded gate finds no ids and assumes the feature ships.
+- **Ad unit ids from outside the source.** With `--dart-define`, `.env`,
+  `EXPO_PUBLIC_*` or a config file, the rewarded gate finds no ids and assumes
+  the feature ships.
+- **React Native libraries outside its table.** Capability patterns cover
+  react-native-google-mobile-ads, react-native-iap / expo-iap, RevenueCat,
+  Firebase auth, Google and Apple sign-in, WebSocket and socket.io. Anything
+  else needs a `code_rn` pattern.
 
 ## Fixing a failure
 
@@ -132,7 +148,9 @@ agree rather than adding the word to the listing.
 
 `CAPABILITY_CLAIMS` near the top of the script is a list of dicts: `asserts`
 and `denies` (regexes over the lowercased listing), `code` (regexes over
-comment-stripped Dart) and optional `absent_if` (the release gate). Adding a
+comment-stripped source, either stack), optional `code_rn` (extra patterns
+used only for React Native / Expo) and optional `absent_if` (the release
+gate). Adding a
 capability is one dict; adding a stop word is one word in `STOPWORDS`. Four
 rules, each learned by getting it wrong first:
 

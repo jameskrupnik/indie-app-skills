@@ -567,6 +567,16 @@ def check_probe(repo: Repo) -> List[Finding]:
     )]
 
 
+RN_DOC = """
+React Native / Expo (auto-detected from package.json): the same idea, with
+per-frame code found as useFrameCallback, requestAnimationFrame loops and
+functions taking an SkCanvas (certain), and useDerivedValue /
+useAnimatedStyle / useAnimatedProps / useAnimatedReaction / createPicture
+(per frame only while animating, reported one level lower). Calls are
+followed three levels, across files. Component render bodies get separate
+re-render checks (scope "render"). See rn_perf.py.
+"""
+
 CHECKS = [
     ("text-layout-per-frame", check_text_layout),
     ("decode-per-frame", check_image_decode),
@@ -585,13 +595,58 @@ GREEN, DIM, OFF = "\033[32m", "\033[2m", "\033[0m"
 RANK = {"FAIL": 0, "WARN": 1, "NOTE": 2}
 
 
+def detect_stacks(root: Path, repo: Repo, choice: str) -> Tuple[bool, bool]:
+    """(flutter, react_native) for [root]. `auto` looks for Dart under lib/
+    and for a package.json depending on react-native or expo."""
+    if choice == "flutter":
+        return True, False
+    if choice == "rn":
+        return False, True
+    import rn_source
+    return bool(repo.lib), rn_source.detect_rn(root)
+
+
+def print_report(findings: List[Finding], order: List[str], tty: bool,
+                 ok_message: str) -> None:
+    def c(colour: str, s: str) -> str:
+        return f"{colour}{s}{OFF}" if tty else s
+
+    if not findings:
+        print(f"  {c(GREEN, 'OK')}  {ok_message}")
+        return
+    groups: Dict[Tuple[str, str], List[Finding]] = {}
+    for f in findings:
+        groups.setdefault((f.check, f.level), []).append(f)
+    for (check, level) in sorted(
+            groups, key=lambda k: (RANK[k[1]], order.index(k[0])
+                                   if k[0] in order else len(order))):
+        group = groups[(check, level)]
+        files = len({f.path for f in group})
+        print(f"  {c(COLOUR[level], level)}  {check}  ({len(group)})")
+        for f in group[:6]:
+            print(f"        {c(DIM, f'{f.path}:{f.line}')}")
+        if len(group) > 6:
+            print(c(DIM, f"        ... and {len(group) - 6} more, "
+                         f"{files} file(s) in all"))
+        print(f"        {group[0].message}\n")
+
+
 def main() -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import rn_perf
+
     ap = argparse.ArgumentParser(
-        description=__doc__,
+        description=__doc__ + RN_DOC,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="checks: " + ", ".join(n for n, _ in CHECKS))
+        epilog="checks (Flutter): " + ", ".join(n for n, _ in CHECKS)
+        + "\nchecks (React Native / Expo): " + ", ".join(rn_perf.CHECK_NAMES))
     ap.add_argument("--app", default=".",
-                    help="Flutter project or monorepo root (default: .)")
+                    help="Flutter, React Native or Expo project, or monorepo "
+                    "root (default: .)")
+    ap.add_argument("--stack", choices=("auto", "flutter", "rn"),
+                    default="auto",
+                    help="which checks to run (default: auto-detect; both "
+                    "run when both stacks are present)")
     ap.add_argument("--json", action="store_true",
                     help="print findings as a JSON array")
     ap.add_argument("--strict", action="store_true",
@@ -605,19 +660,32 @@ def main() -> int:
         print(f"not a directory: {root}", file=sys.stderr)
         return 2
     repo = Repo.load(root)
-    if not repo.lib:
+    flutter, rn = detect_stacks(root, repo, args.stack)
+    if not repo.lib and not rn:
         print(f"no Dart sources under a lib/ directory in {root}",
               file=sys.stderr)
+        flutter = True  # keep the original behaviour: report nothing
 
     findings: List[Finding] = []
-    for _, fn in CHECKS:
-        findings += fn(repo)
+    if flutter:
+        for _, fn in CHECKS:
+            findings += fn(repo)
+    rn_findings: List[Finding] = []
+    rn_repo = None
+    if rn:
+        rn_repo, raw = rn_perf.run(root)
+        rn_findings = [Finding(f.check, f.level, f.path, f.line, f.message,
+                               f.scope) for f in raw]
+        if not rn_repo.files:
+            print(f"no JS/TS sources found in {root}", file=sys.stderr)
     if args.quiet:
         findings = [f for f in findings if f.level != "NOTE"]
-    code = 1 if (args.strict and findings) else 0
+        rn_findings = [f for f in rn_findings if f.level != "NOTE"]
+    code = 1 if (args.strict and (findings or rn_findings)) else 0
 
     if args.json:
-        print(json.dumps([asdict(f) for f in findings], indent=2))
+        print(json.dumps([asdict(f) for f in findings + rn_findings],
+                         indent=2))
         return code
 
     tty = sys.stdout.isatty()
@@ -625,32 +693,28 @@ def main() -> int:
     def c(colour: str, s: str) -> str:
         return f"{colour}{s}{OFF}" if tty else s
 
-    hot = sum(1 for p in repo.lib if repo.hot(p).spans)
-    print(f"Frame cost: {root.name}")
-    print(f"  {len(repo.lib)} source file(s), {hot} with per-frame methods\n")
-
-    if not findings:
-        print(f"  {c(GREEN, 'OK')}  nothing repeating per frame that a "
-              "static check can see.")
-        return code
-
-    groups: Dict[Tuple[str, str], List[Finding]] = {}
-    for f in findings:
-        groups.setdefault((f.check, f.level), []).append(f)
-    order = [n for n, _ in CHECKS]
-    for (check, level) in sorted(
-            groups, key=lambda k: (RANK[k[1]], order.index(k[0]))):
-        group = groups[(check, level)]
-        files = len({f.path for f in group})
-        print(f"  {c(COLOUR[level], level)}  {check}  ({len(group)})")
-        for f in group[:6]:
-            print(f"        {c(DIM, f'{f.path}:{f.line}')}")
-        if len(group) > 6:
-            print(c(DIM, f"        ... and {len(group) - 6} more, "
-                         f"{files} file(s) in all"))
-        print(f"        {group[0].message}\n")
-    print(c(DIM, "Each of these is a hypothesis. Measure it, paired, before "
-                 "and after: see SKILL.md."))
+    if flutter:
+        hot = sum(1 for p in repo.lib if repo.hot(p).spans)
+        print(f"Frame cost: {root.name}")
+        print(f"  {len(repo.lib)} source file(s), {hot} with per-frame "
+              "methods\n")
+        print_report(findings, [n for n, _ in CHECKS], tty,
+                     "nothing repeating per frame that a static check can "
+                     "see.")
+    if rn and rn_repo is not None:
+        if flutter:
+            print()
+        hot = sum(1 for p in rn_repo.files
+                  if any(h.certain for h in rn_repo.hot.get(p, [])))
+        print(f"Frame cost: {root.name} (React Native)")
+        print(f"  {len(rn_repo.files)} source file(s), {hot} with per-frame "
+              "code (frame callbacks, rAF loops, Skia drawing)\n")
+        print_report(rn_findings, rn_perf.CHECK_NAMES, tty,
+                     "nothing repeating per frame or per render that a "
+                     "static check can see.")
+    if findings or rn_findings:
+        print(c(DIM, "Each of these is a hypothesis. Measure it, paired, "
+                     "before and after: see SKILL.md."))
     return code
 
 

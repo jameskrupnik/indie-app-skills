@@ -362,12 +362,49 @@ GREEN, DIM, OFF = "\033[32m", "\033[2m", "\033[0m"
 RANK = {"FAIL": 0, "WARN": 1, "NOTE": 2}
 
 
+RN_DOC = """
+React Native / Expo (auto-detected from package.json): the same faults in
+React Native's vocabulary - Pressables with no accessible name, role or
+size, text that cannot scale, fixed heights around Text, motion that ignores
+Reduce Motion, vibration with no switch, missing safe areas, Dimensions read
+at load, images with no alt. See rn_polish.py.
+"""
+
+
+def print_groups(findings: List[Finding], tty: bool) -> None:
+    def c(colour: str, s: str) -> str:
+        return f"{colour}{s}{OFF}" if tty else s
+
+    groups: Dict[str, List[Finding]] = {}
+    for f in sorted(findings, key=lambda f: RANK[f.level]):
+        groups.setdefault(f.check, []).append(f)
+    for check, group in groups.items():
+        level = group[0].level
+        print(f"  {c(COLOUR[level], level)}  {check}  ({len(group)})")
+        for f in group[:8]:
+            print(f"        {c(DIM, f'{f.path}:{f.line}')}  {f.message}")
+        if len(group) > 8:
+            print(c(DIM, f"        ... and {len(group) - 8} more"))
+        print()
+
+
 def main() -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import rn_polish
+    import rn_source
+
     ap = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        description=__doc__ + RN_DOC,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="checks (React Native / Expo): "
+        + ", ".join(rn_polish.CHECK_NAMES))
     ap.add_argument("--app", default=".",
-                    help="Flutter project or monorepo root (default: .)")
+                    help="Flutter, React Native or Expo project, or monorepo "
+                    "root (default: .)")
+    ap.add_argument("--stack", choices=("auto", "flutter", "rn"),
+                    default="auto",
+                    help="which checks to run (default: auto-detect; both "
+                    "run when both stacks are present)")
     ap.add_argument("--json", action="store_true",
                     help="print findings as a JSON array")
     ap.add_argument("--strict", action="store_true",
@@ -381,18 +418,36 @@ def main() -> int:
         print(f"not a directory: {root}", file=sys.stderr)
         return 2
     repo = Repo.load(root)
-    if not repo.lib:
-        print(f"no Dart sources under a lib/ directory in {root}",
-              file=sys.stderr)
-        findings: List[Finding] = []
+    if args.stack == "flutter":
+        flutter, rn = True, False
+    elif args.stack == "rn":
+        flutter, rn = False, True
     else:
-        findings = [f for _, fn in CHECKS for f in fn(repo)]
+        rn = rn_source.detect_rn(root)
+        flutter = bool(repo.lib) or not rn
+    findings: List[Finding] = []
+    if flutter:
+        if not repo.lib:
+            print(f"no Dart sources under a lib/ directory in {root}",
+                  file=sys.stderr)
+        else:
+            findings = [f for _, fn in CHECKS for f in fn(repo)]
+    rn_findings: List[Finding] = []
+    rn_repo = None
+    if rn:
+        rn_repo, raw = rn_polish.run(root)
+        rn_findings = [Finding(f.check, f.level, f.path, f.line, f.message)
+                       for f in raw]
+        if not rn_repo.files:
+            print(f"no JS/TS sources found in {root}", file=sys.stderr)
     if args.quiet:
         findings = [f for f in findings if f.level != "NOTE"]
-    code = 1 if (args.strict and findings) else 0
+        rn_findings = [f for f in rn_findings if f.level != "NOTE"]
+    code = 1 if (args.strict and (findings or rn_findings)) else 0
 
     if args.json:
-        print(json.dumps([asdict(f) for f in findings], indent=2))
+        print(json.dumps([asdict(f) for f in findings + rn_findings],
+                         indent=2))
         return code
 
     tty = sys.stdout.isatty()
@@ -400,22 +455,21 @@ def main() -> int:
     def c(colour: str, s: str) -> str:
         return f"{colour}{s}{OFF}" if tty else s
 
-    print(f"Polish: {root.name}")
-    print(f"  {len(repo.lib)} source file(s), {len(repo.tests)} test "
-          "file(s)\n")
-    if not findings:
-        print(f"  {c(GREEN, 'OK')}  nothing the static checks can see.")
-    groups: Dict[str, List[Finding]] = {}
-    for f in sorted(findings, key=lambda f: RANK[f.level]):
-        groups.setdefault(f.check, []).append(f)
-    for check, group in groups.items():
-        level = group[0].level
-        print(f"  {c(COLOUR[level], level)}  {check}  ({len(group)})")
-        for f in group[:8]:
-            print(f"        {c(DIM, f'{f.path}:{f.line}')}  {f.message}")
-        if len(group) > 8:
-            print(c(DIM, f"        ... and {len(group) - 8} more"))
-        print()
+    if flutter:
+        print(f"Polish: {root.name}")
+        print(f"  {len(repo.lib)} source file(s), {len(repo.tests)} test "
+              "file(s)\n")
+        if not findings:
+            print(f"  {c(GREEN, 'OK')}  nothing the static checks can see.")
+        print_groups(findings, tty)
+    if rn and rn_repo is not None:
+        if flutter:
+            print()
+        print(f"Polish: {root.name} (React Native)")
+        print(f"  {len(rn_repo.files)} source file(s)\n")
+        if not rn_findings:
+            print(f"  {c(GREEN, 'OK')}  nothing the static checks can see.")
+        print_groups(rn_findings, tty)
     print(c(DIM, "These are the mechanical ones. The ones that matter most "
                  "need a screenshot: see SKILL.md."))
     return code

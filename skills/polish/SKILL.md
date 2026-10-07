@@ -1,6 +1,6 @@
 ---
 name: polish
-description: Find and fix the last 10% of a Flutter app or game — the faults that make it feel unfinished while analyze is clean and every test passes. Use when asked to polish an app, do final touches, make something feel complete or "next level", or before a first store submission; when something "feels off" or "looks unfinished" but nothing is broken; when adding tablet or iPad support or checking a layout on a larger screen; for an accessibility pass (Reduce Motion, Dynamic Type, large text, VoiceOver, TalkBack, screen-reader labels); or when a layout is stretched, cramped, clipped or overflowing on some devices but not others.
+description: Find and fix the last 10% of a Flutter, React Native or Expo app or game — the faults that make it feel unfinished while analyze or tsc is clean and every test passes. Use when asked to polish an app, do final touches, make something feel complete or "next level", or before a first store submission; when something "feels off" or "looks unfinished" but nothing is broken; when adding tablet or iPad support or checking a layout on a larger screen; for an accessibility pass (Reduce Motion, Dynamic Type, large text, font scaling, VoiceOver, TalkBack, screen-reader labels, tap targets, safe areas); or when a layout is stretched, cramped, clipped or overflowing on some devices but not others.
 ---
 
 # Polish
@@ -23,6 +23,12 @@ python3 ${CLAUDE_SKILL_DIR}/check_polish.py --app .
 `--json` for a hook, `--strict` exits 1 on any finding, `--quiet` hides NOTEs,
 `--help` lists the checks. Everything is advisory: it flags shapes, and a
 shape can be deliberate.
+
+The stack is detected (Dart under `lib/`, or a `package.json` depending on
+`react-native` or `expo`); `--stack flutter|rn` forces one. On React Native
+or Expo, the catalogue below still holds; the
+[React Native and Expo](#react-native-and-expo) section maps it to RN's
+APIs and lists the RN checks.
 
 Then do what the script cannot: **look at it** on the largest and smallest
 device you support, at large text. Most of what matters is only visible there.
@@ -99,6 +105,31 @@ rather than when someone happens to look at a small phone.
 4. Walk the system settings: Reduce Motion, large text, a screen reader on
    the menus.
 5. Re-capture. The store screenshots are also the proof.
+
+## React Native and Expo
+
+The same faults, in React Native's vocabulary. The script skips
+`node_modules`, `build`, `.expo`, `Pods` and the native folders.
+
+| Check | What it flags | Why |
+|---|---|---|
+| `icon-label` | A `Pressable`/`Touchable*` with no `accessibilityLabel` and no `Text` inside | Touchables are accessible by default and build their label from `Text` children; an icon alone gives nothing to read |
+| `a11y-role` | No `accessibilityRole`/`role` | The screen reader does not say "button" |
+| `tap-target` | A pressable whose style is under 44pt on a side, with no `hitSlop` | Apple asks for 44pt, Material for 48dp; `hitSlop` grows the touch area without growing the box |
+| `font-scaling` | `allowFontScaling={false}`, or `maxFontSizeMultiplier` between 1 and 1.5 | Text then ignores the system size. `0` means no cap, a value `>= 1` caps it |
+| `fixed-height-text` | A literal `height` on a `View`/`Text`/pressable that holds `Text` | The fixed-height-around-text fault. `minHeight` or padding |
+| `reduce-motion` | `Animated.loop`, `ReduceMotion.Never`, or a `useFrameCallback`/`useClock` (NOTE) in a file that never asks about Reduce Motion | Reanimated animations default to `ReduceMotion.System` and honour the setting; core `Animated` and frame-driven motion do not. Use `useReducedMotion()` or `AccessibilityInfo.isReduceMotionEnabled()` |
+| `haptics-switch` | `Vibration.vibrate` or expo-haptics `impactAsync`/`notificationAsync` with no in-app switch | iOS skips expo-haptics when system haptics are off; on Android those two are simulated with the `Vibrator` API |
+| `safe-area` | No safe-area handling anywhere, or `SafeAreaView` imported from `react-native` | RN's own `SafeAreaView` is deprecated and iOS-only; use react-native-safe-area-context |
+| `dimensions-at-load` | `Dimensions.get` at module scope | Read once at load, stale after rotation, split view or a fold. `useWindowDimensions()` |
+| `image-alt` | An `Image` with no `alt`/`accessibilityLabel` (NOTE) | Images are not accessible by default; fine if decorative |
+| `content-cap` | A `maxWidth` no iPad reaches in portrait | As above |
+| `tablet-layout` | Expo `ios.supportsTablet: true` and nothing reads the window size at render time | Every iPad gets the stretched phone layout |
+
+To render at the settings nobody uses: raise the system text size (iOS
+Larger Text, Android Font size) and turn on Reduce Motion on the simulator
+or emulator, then look. There is no `untested-scale` check on React Native;
+Jest rarely renders at a font scale, so the screenshot is the test.
 
 ## Across several apps
 

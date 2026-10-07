@@ -1,26 +1,31 @@
 #!/usr/bin/env bash
-# Pre-upload checks for a Flutter app bundle going to Google Play.
+# Pre-upload checks for a Flutter, React Native or Expo app bundle going to
+# Google Play.
 #
 # Checks what is silently wrong at upload time and that no test suite covers:
 #
 #   - signed with a real upload key, not the debug key Gradle falls back to
 #   - targetSdkVersion against Play's current minimum (needs bundletool)
 #   - the AD_ID permission, which must agree with the Advertising ID declaration
-#   - assets bundled from dependencies under flutter_assets/packages/
+#   - assets bundled from dependencies (flutter_assets/packages/, or the
+#     node_modules_* resources a React Native bundle carries)
 #   - store text within Play's limits, in every locale (counted in characters)
 #   - icon, feature graphic and screenshots within Play's size rules
 #   - the privacy policy URL actually resolving
 #   - EEA consent: gathering AND the in-app revocation entry point
+#   - React Native / Expo only: package, versionCode, release signingConfig,
+#     eas.json build type and AD_ID removal, read from the project
 #
-# It cannot tell which build configuration (flavor, --dart-define) produced
-# the bundle. See SKILL.md.
+# It cannot tell which build configuration (flavor, --dart-define, env vars)
+# produced the bundle. See SKILL.md.
 #
-# Run from the Flutter project root. Expected layout:
-#   pubspec.yaml
-#   build/app/outputs/bundle/release/app-release.aab   (default bundle path)
-#   fastlane/metadata/android/<locale>/{title,short_description,full_description}.txt
-#   fastlane/metadata/android/<locale>/images/{icon.png,featureGraphic.png,
-#       phoneScreenshots/,sevenInchScreenshots/,tenInchScreenshots/}
+# Run from the project root (pubspec.yaml, or package.json with react-native).
+# Default bundle path: build/app/outputs/bundle/release/app-release.aab
+# (Flutter) or android/app/build/outputs/bundle/release/app-release.aab (React
+# Native, Expo with android/). An EAS-built .aab: download it, pass its path.
+# Listing: fastlane/metadata/android/<locale>/{title,short_description,
+#   full_description}.txt and images/{icon.png,featureGraphic.png,
+#   phoneScreenshots/,sevenInchScreenshots/,tenInchScreenshots/}
 #
 # Usage:
 #   preflight.sh [--metadata DIR] [--offline] [--quiet] [path/to/app.aab]
@@ -34,14 +39,15 @@
 #                         for new apps and updates from 2026-08-31)
 #   PLAY_ASSET_ALLOW      extended regex of package asset paths not to report
 #
-# Needs: unzip, a JDK's jarsigner. Optional: bundletool, curl, sips (macOS).
+# Needs: unzip, a JDK's jarsigner. Optional: bundletool, curl, sips (macOS),
+# python3 (reads app.json / eas.json for React Native and Expo).
 # Exit: 0 no failures (warnings allowed), 1 at least one failure, 2 bad usage.
 
 set -uo pipefail
 
-usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; }
 
-AAB="build/app/outputs/bundle/release/app-release.aab"
+AAB=""
 META_ROOT="fastlane/metadata/android"
 OFFLINE=0
 QUIET=0
@@ -99,12 +105,113 @@ imgsize() {
 
 filesize() { wc -c < "$1" | tr -d ' '; }
 
-[ -f pubspec.yaml ] || warn "no pubspec.yaml here — run this from the Flutter project root"
+# --- stack -------------------------------------------------------------------
+# pubspec.yaml = Flutter; package.json naming react-native = React Native, and
+# Expo when the expo package or an app.json "expo" key is there too.
+STACK=""
+if [ -f pubspec.yaml ]; then STACK=flutter
+elif [ -f package.json ] && LC_ALL=C grep -q '"react-native"[[:space:]]*:' package.json; then
+  STACK=rn
+  if LC_ALL=C grep -q '"expo"[[:space:]]*:' package.json \
+     || { [ -f app.json ] && LC_ALL=C grep -q '"expo"[[:space:]]*:' app.json; } \
+     || [ -f app.config.js ] || [ -f app.config.ts ]; then STACK=expo; fi
+fi
+if [ -z "$AAB" ]; then
+  case "$STACK" in
+    rn|expo) AAB="android/app/build/outputs/bundle/release/app-release.aab" ;;
+    *)       AAB="build/app/outputs/bundle/release/app-release.aab" ;;
+  esac
+fi
+[ -n "$STACK" ] || warn "no pubspec.yaml or React Native package.json here — run this from the project root"
+
+# Read a dotted key from a JSON file (app.json, eas.json); empty if absent.
+json_get() {
+  [ -f "$1" ] && have python3 || return 0
+  python3 -c '
+import json, sys
+try:
+    v = json.load(open(sys.argv[1], encoding="utf-8"))
+    for k in sys.argv[2].split("."):
+        v = v[k]
+except Exception:
+    sys.exit(0)
+print(json.dumps(v) if isinstance(v, (list, dict)) else v)
+' "$1" "$2" 2>/dev/null
+}
+
+# --- project (React Native / Expo) --------------------------------------------
+# What the bundle cannot say: where its package, version and signing came from.
+# Flutter projects skip this section.
+if [ "$STACK" = rn ] || [ "$STACK" = expo ]; then
+  head2 "Project ($( [ "$STACK" = expo ] && echo Expo || echo 'React Native'))"
+  GRADLE=""
+  for g in android/app/build.gradle android/app/build.gradle.kts; do
+    [ -f "$g" ] && { GRADLE="$g"; break; }
+  done
+  if [ -n "$GRADLE" ]; then
+    PKG=$(LC_ALL=C grep -m1 -E '^[[:space:]]*applicationId[[:space:]=(]' "$GRADLE" | sed -E 's/.*["'"'"']([^"'"'"']+)["'"'"'].*/\1/')
+    VC=$(LC_ALL=C grep -m1 -E '^[[:space:]]*versionCode[[:space:]=(]' "$GRADLE" | grep -oE '[0-9]+' | head -1)
+    pass "android/ present — package ${PKG:-?}, versionCode ${VC:-?} (from $GRADLE)"
+    if [ "$STACK" = expo ]; then
+      note "With android/ checked in, app.json's android settings reach the build only"
+      note "through npx expo prebuild; edit native files or re-run prebuild."
+    fi
+    # The React Native template signs release with the debug keystore. A local
+    # ./gradlew bundleRelease then yields a debug-signed bundle; EAS Build
+    # injects its own signing config, so there it is harmless.
+    REL=$(awk '/^[[:space:]]*(release|getByName\("release"\))[[:space:]]*\{/ {inrel=1}
+               inrel && /signingConfig/ {print; exit}' "$GRADLE")
+    if printf '%s' "$REL" | LC_ALL=C grep -qE 'signingConfigs\.debug|getByName\("debug"\)'; then
+      if [ -f eas.json ]; then
+        warn "$GRADLE signs release with the debug key — fine for EAS Build (it injects"
+        note "its own signing), wrong for a local ./gradlew bundleRelease"
+      else
+        fail "$GRADLE signs release with signingConfigs.debug (the template default)"
+        note "Add a release signingConfig for your upload key before building."
+      fi
+    fi
+  elif [ "$STACK" = expo ]; then
+    PKG=$(json_get app.json expo.android.package)
+    VC=$(json_get app.json expo.android.versionCode)
+    if [ -n "$PKG" ]; then pass "no android/ — package $PKG, versionCode ${VC:-unset} (from app.json)"
+    elif [ -f app.config.js ] || [ -f app.config.ts ]; then
+      warn "app.config.js/ts is code — package and versionCode not read; check them"
+    else fail "no android/ and no expo.android.package in app.json — Play needs a package name"; fi
+    note "EAS Build signs with the keystore in its credentials (eas credentials)."
+  else
+    fail "no android/app/build.gradle — not a buildable React Native Android project"
+  fi
+  if [ -f eas.json ]; then
+    BT=$(json_get eas.json build.production.android.buildType)
+    if [ "$BT" = apk ]; then
+      fail "eas.json production profile builds an apk — Play takes an app-bundle"
+    elif [ -n "$(json_get eas.json build.production)" ]; then
+      pass "eas.json production profile builds ${BT:-app-bundle}"
+    fi
+    [ "$(json_get eas.json cli.appVersionSource)" = remote ] && \
+      note "eas.json appVersionSource is remote: EAS, not the project, owns versionCode"
+  fi
+  # AD_ID: react-native-google-mobile-ads merges it in like the Flutter plugin.
+  if LC_ALL=C grep -q '"react-native-google-mobile-ads"' package.json; then
+    if json_get app.json expo.android.blockedPermissions | LC_ALL=C grep -q 'gms.permission.AD_ID' \
+       || { [ -f android/app/src/main/AndroidManifest.xml ] \
+            && LC_ALL=C grep -A2 'gms\.permission\.AD_ID' android/app/src/main/AndroidManifest.xml \
+               | LC_ALL=C grep -q 'tools:node="remove"'; }; then
+      pass "AD_ID removed in project config (blockedPermissions or tools:node=\"remove\")"
+    else
+      pass "AD_ID not removed in project config — react-native-google-mobile-ads merges it in"
+    fi
+  fi
+fi
 
 # --- bundle ------------------------------------------------------------------
 head2 "Bundle"
 if [ ! -f "$AAB" ]; then
-  fail "no bundle at $AAB — build one first (flutter build appbundle)"
+  case "$STACK" in
+    rn)   fail "no bundle at $AAB — build one first (cd android && ./gradlew bundleRelease)" ;;
+    expo) fail "no bundle at $AAB — build one first (eas build -p android, then pass the downloaded .aab)" ;;
+    *)    fail "no bundle at $AAB — build one first (flutter build appbundle)" ;;
+  esac
   echo
   echo "Nothing else can be checked without it."
   exit 1
@@ -141,7 +248,10 @@ else
     esac
   elif printf '%s' "$SIGNER" | LC_ALL=C grep -qiE 'CN=Android Debug|O=Android'; then
     fail "signed with the DEBUG key: $SIGNER"
-    note "android/key.properties missing or unreadable — Gradle fell back silently"
+    case "$STACK" in
+      rn|expo) note "the release signingConfig in android/app/build.gradle points at the debug keystore" ;;
+      *) note "android/key.properties missing or unreadable — Gradle fell back silently" ;;
+    esac
   else
     pass "signed by $SIGNER"
   fi
@@ -208,11 +318,21 @@ fi
 # another app's artwork riding in through a shared package, which a reviewer
 # can read as a repackaged app. Listed for a human to judge, not failed.
 head2 "Bundled package assets"
-ALLOW="${PLAY_ASSET_ALLOW:-/packages/(cupertino_icons|wakelock_plus|flutter_local_notifications_web)/}"
-PKGS=$(unzip -Z1 "$AAB" 2>/dev/null \
-  | LC_ALL=C grep '^base/assets/flutter_assets/packages/[^/]*/.*[^/]$' \
-  | LC_ALL=C grep -vE "$ALLOW" \
-  | cut -d/ -f5 | sort | uniq -c | awk '{printf "%s (%s)\n", $2, $1}')
+if [ "$STACK" = rn ] || [ "$STACK" = expo ]; then
+  # React Native names an image required from node_modules after its path
+  # (node_modules_<package>_..._<file>), so the package is the next segment.
+  ALLOW="${PLAY_ASSET_ALLOW:-^$}"
+  PKGS=$(unzip -Z1 "$AAB" 2>/dev/null \
+    | LC_ALL=C grep -E '^base/res/(drawable|raw)[^/]*/node_modules_[^/]+$' \
+    | LC_ALL=C grep -vE "$ALLOW" \
+    | sed -E 's#^.*/node_modules_([^_]+)_.*#\1#' | sort | uniq -c | awk '{printf "%s (%s)\n", $2, $1}')
+else
+  ALLOW="${PLAY_ASSET_ALLOW:-/packages/(cupertino_icons|wakelock_plus|flutter_local_notifications_web)/}"
+  PKGS=$(unzip -Z1 "$AAB" 2>/dev/null \
+    | LC_ALL=C grep '^base/assets/flutter_assets/packages/[^/]*/.*[^/]$' \
+    | LC_ALL=C grep -vE "$ALLOW" \
+    | cut -d/ -f5 | sort | uniq -c | awk '{printf "%s (%s)\n", $2, $1}')
+fi
 if [ -n "$PKGS" ]; then
   warn "dependencies ship assets in this bundle — confirm each belongs here:"
   printf '%s\n' "$PKGS" | sed 's/^/          /'
@@ -360,8 +480,41 @@ fi
 # itself tells users to look for that control in the app, so shipping the
 # message without it describes a control that does not exist. Neither store
 # flags the gap. Details: reference.md.
-head2 "EEA consent (google_mobile_ads)"
 SRC_EXCLUDES="--exclude-dir=build --exclude-dir=.dart_tool --exclude-dir=.git --exclude-dir=Pods --exclude-dir=node_modules"
+eea_tail() {
+  warn "confirm AdMob has a PUBLISHED European regulations message for this app"
+  note "(Privacy & messaging > European regulations; publishing needs a privacy"
+  note "policy URL and the 'Do not consent' option, which is off by default)."
+}
+if [ "$STACK" = rn ] || [ "$STACK" = expo ]; then
+  head2 "EEA consent (react-native-google-mobile-ads)"
+  JS_EXCLUDES="$SRC_EXCLUDES --exclude-dir=.expo --exclude-dir=android --exclude-dir=ios --exclude-dir=dist --exclude-dir=coverage"
+  JS_INCLUDES="--include=*.ts --include=*.tsx --include=*.js --include=*.jsx"
+  # A call named only in a comment ("TODO: add showPrivacyOptionsForm") is not
+  # a call: drop matches on lines that start as // or * comments.
+  js_calls() {
+    # shellcheck disable=SC2086
+    grep -rhsE $JS_INCLUDES $JS_EXCLUDES "$1" . \
+      | LC_ALL=C grep -vE '^[[:space:]]*(//|/?\*)' | LC_ALL=C grep -qE "$1"
+  }
+  if LC_ALL=C grep -q '"react-native-google-mobile-ads"' package.json; then
+    if js_calls 'requestInfoUpdate|gatherConsent|loadAndShowConsentFormIfRequired'; then
+      pass "consent gathering present (AdsConsent.requestInfoUpdate / gatherConsent)"
+    else
+      fail "no AdsConsent.requestInfoUpdate or gatherConsent — the UMP consent SDK is never asked"
+    fi
+    if js_calls 'showPrivacyOptionsForm'; then
+      pass "privacy options entry point present (the revocation link)"
+    else
+      fail "no AdsConsent.showPrivacyOptionsForm call — users cannot withdraw consent"
+      note "Add a settings entry that calls it BEFORE publishing an EEA message."
+    fi
+    eea_tail
+  else
+    pass "react-native-google-mobile-ads not a dependency — nothing to check"
+  fi
+else
+head2 "EEA consent (google_mobile_ads)"
 # shellcheck disable=SC2086
 if grep -rqsE --include=pubspec.yaml $SRC_EXCLUDES '^[[:space:]]+google_mobile_ads:' .; then
   # shellcheck disable=SC2086
@@ -377,19 +530,25 @@ if grep -rqsE --include=pubspec.yaml $SRC_EXCLUDES '^[[:space:]]+google_mobile_a
     fail "no ConsentForm.showPrivacyOptionsForm call — users cannot withdraw consent"
     note "Add a settings entry that calls it BEFORE publishing an EEA message."
   fi
-  warn "confirm AdMob has a PUBLISHED European regulations message for this app"
-  note "(Privacy & messaging > European regulations; publishing needs a privacy"
-  note "policy URL and the 'Do not consent' option, which is off by default)."
+  eea_tail
 else
   pass "google_mobile_ads not a dependency — nothing to check"
+fi
 fi
 
 # --- the one it cannot check -------------------------------------------------
 head2 "Build configuration — not checkable"
+if [ "$STACK" = rn ] || [ "$STACK" = expo ]; then
+  note "Nothing in a bundle reliably says which build variant or environment"
+  note "(EXPO_PUBLIC_* or .env values inlined at build time) produced it. If both"
+  note "production and test ids are compiled in, both appear as strings either"
+  note "way. If unsure, rebuild with the production settings stated explicitly."
+else
 note "Nothing in a bundle reliably says which flavor or --dart-define produced"
 note "it. If both production and test ids are compiled in as constants, both"
 note "appear as strings either way. If unsure, rebuild with the production"
 note "flags stated explicitly."
+fi
 
 head2 "Result"
 if [ "$FAIL" -eq 0 ]; then
