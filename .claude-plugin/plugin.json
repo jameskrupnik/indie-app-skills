@@ -1,9 +1,20 @@
 {
   "name": "indie-app-skills",
   "version": "0.1.0",
-  "description": "Claude Code skills for shipping small Flutter apps: store-rejection checks, Google Play releases, performance, polish, niche research, and keeping CLAUDE.md under its size limit.",
-  "author": { "name": "James Krupnik", "url": "https://github.com/jameskrupnik" },
+  "description": "Claude Code skills for shipping small Flutter apps: store-rejection checks, Google Play releases, performance, polish, niche research, writing that reads as human, and keeping CLAUDE.md under its size limit.",
+  "author": {
+    "name": "James Krupnik",
+    "url": "https://github.com/jameskrupnik"
+  },
   "repository": "https://github.com/jameskrupnik/indie-app-skills",
   "license": "MIT",
-  "keywords": ["flutter", "app-store", "google-play", "performance", "aso", "claude-md"]
+  "keywords": [
+    "flutter",
+    "app-store",
+    "google-play",
+    "performance",
+    "aso",
+    "claude-md",
+    "writing"
+  ]
 }
