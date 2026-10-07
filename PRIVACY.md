@@ -16,8 +16,9 @@ Three things leave your machine, and only when you run them:
   It does not send anything itself.
 
 No other script makes a network request. The scripts read files in the
-project you point them at and print findings; the few that write (such as
-`claude-md-trim` moving text into `docs/`) write only inside that project.
+project you point them at and print findings; none of them writes to disk.
+When a skill has Claude edit files (`claude-md-trim` moving text into
+`docs/`, for example), the edits stay inside that project.
 
 Questions: open an issue at
 https://github.com/jameskrupnik/indie-app-skills/issues
