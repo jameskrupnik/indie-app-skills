@@ -20,12 +20,13 @@ seemed obviously true.
 | `polish` | Finds the layout, accessibility and Reduce Motion faults that make an app feel unfinished. | `check_polish.py` |
 | `niche-scout` | Measures an app idea against the free iTunes Search API and kills the dead ones before any code is written. App Store only. | `sweep.py` |
 | `claude-md-trim` | Brings CLAUDE.md, AGENTS.md and their imports back under Claude Code's size warning by moving evidence into `docs/` without losing a rule, then checks every link still resolves. | `check_size.py` |
+| `human-voice` | Catches the tells that make a Reddit reply, cold email, cover letter, pin or store listing read as machine-written (dashes, "it's not X, it's Y", hype words, even paragraphs, templated batches), with a register for each surface. | `check_voice.py` |
 
 The scripts need only Python 3.9+ and bash; no packages to install. Every one
 answers `--help`, and those that check a project take `--json` for hooks and CI.
 The store skills assume a Flutter project that keeps its listing under
 `fastlane/metadata` (the per-platform `ios/fastlane` and `android/fastlane`
-layouts are found too). `claude-md-trim` and `niche-scout` work for any project.
+layouts are found too). `claude-md-trim`, `human-voice` and `niche-scout` work for any project.
 
 ## The paid skills
 
