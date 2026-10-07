@@ -27,6 +27,22 @@ The store skills assume a Flutter project that keeps its listing under
 `fastlane/metadata` (the per-platform `ios/fastlane` and `android/fastlane`
 layouts are found too). `claude-md-trim` and `niche-scout` work for any project.
 
+## The paid skills
+
+The release pipeline these checks were built for is sold separately on
+[Agensi](https://www.agensi.io/creators/james-krupnik), $15 each or
+[$39 for all four](https://www.agensi.io/bundles/flutter-indie-release-pipeline):
+
+| Skill | What it does |
+|---|---|
+| [New App from a Fork](https://www.agensi.io/skills/flutter-new-app-from-a-fork) | Starts a new Flutter app from one of yours without carrying over the parent's Firebase project, ad ids or bundle ids, then takes it to TestFlight. |
+| [Bug Hunt](https://www.agensi.io/skills/flutter-bug-hunt) | Finds the bugs that pass `flutter analyze` and your whole test suite, and fixes each one with a test that fails first. |
+| [TestFlight and App Store Review](https://www.agensi.io/skills/flutter-to-testflight-and-app-store-review) | Ships a fresh fork to a build in App Store review, in the order Apple enforces, with a fix written down for each known error. |
+| [Release Cadence for Many Apps](https://www.agensi.io/skills/flutter-release-cadence-for-many-apps) | For one account with several apps: picks which app goes to review today, runs the pre-release checks, and paces submissions. |
+
+The skills in this repo stay free and MIT-licensed, and none of them needs the
+paid ones.
+
 ## Install
 
 As a Claude Code plugin:
