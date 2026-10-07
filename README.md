@@ -68,6 +68,9 @@ run any script directly, for example
 
 - `play-release/handoff.sh` is macOS-only. It opens Finder and your browser;
   `--dry-run` prints what it would open.
+- Two scripts touch the network: `niche-scout` queries Apple's public search
+  API and `play-release` checks that your privacy policy URL loads. Nothing
+  else leaves your machine. See [PRIVACY.md](PRIVACY.md).
 - Everything the scripts print is a finding to check, not a verdict. Each
   SKILL.md says what its script cannot see.
 - The checks do not help you hide similarity from a reviewer.
