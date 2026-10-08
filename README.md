@@ -39,10 +39,10 @@ The release pipeline these checks were built for is sold separately on
 
 | Skill | What it does |
 |---|---|
-| [New App from a Fork](https://www.agensi.io/skills/flutter-new-app-from-a-fork) | Starts a new Flutter app from one of yours without carrying over the parent's Firebase project, ad ids or bundle ids, then takes it to TestFlight. |
-| [Bug Hunt](https://www.agensi.io/skills/flutter-bug-hunt) | Finds the bugs that pass `flutter analyze` and your whole test suite, and fixes each one with a test that fails first. |
-| [TestFlight and App Store Review](https://www.agensi.io/skills/flutter-to-testflight-and-app-store-review) | Ships a fresh fork to a build in App Store review, in the order Apple enforces, with a fix written down for each known error. |
-| [Release Cadence for Many Apps](https://www.agensi.io/skills/flutter-release-cadence-for-many-apps) | For one account with several apps: picks which app goes to review today, runs the pre-release checks, and paces submissions. |
+| [New App from a Fork](https://www.agensi.io/skills/new-app-from-a-fork-flutter-react-native) | Starts a new Flutter, React Native or Expo app from one of yours without carrying over the parent's Firebase project, ad ids or bundle ids, then takes it to TestFlight. |
+| [Bug Hunt](https://www.agensi.io/skills/bug-hunt-for-flutter-react-native-apps) | Finds the bugs that pass `flutter analyze` and your whole test suite, and fixes each one with a test that fails first. |
+| [TestFlight and App Store Review](https://www.agensi.io/skills/ios-release-to-testflight-flutter-react-native) | Ships a fresh fork to a build in App Store review, in the order Apple enforces, with a fix written down for each known error. |
+| [Release Cadence for Many Apps](https://www.agensi.io/skills/release-cadence-for-many-apps-flutter-react-native) | For one account with several apps: picks which app goes to review today, runs the pre-release checks, and paces submissions. |
 
 The skills in this repo stay free and MIT-licensed, and none of them needs the
 paid ones.
