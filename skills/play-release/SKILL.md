@@ -214,6 +214,13 @@ Play's rules (Play Console Help, "Add preview assets"):
 - **Promotion** in large-format layouts wants at least 4 screenshots at 16:9
   or 9:16 and ≥ 1080 px. Other ratios are accepted but earn no promotion
   credit, so preflight warns rather than fails.
+- **Preview video:** a YouTube URL, not a file. It must be public, embeddable,
+  not age-restricted, not monetized and **not a Short**. YouTube makes every
+  vertical upload a Short, and the console then refuses the URL with "Enter a
+  valid YouTube video URL". So lay a portrait game over a blurred copy of itself
+  at 1920x1080. Use 15-30 s, start on real use in the first second, and use the
+  full `watch?v=` form of the URL. The video shows only if a feature graphic is
+  set. Check at each release that the listing still has one.
 
 **Fill the tablet slots if the app runs on tablets.** Phone, 7-inch and
 10-inch are separate slots, further down the listing page than you expect.

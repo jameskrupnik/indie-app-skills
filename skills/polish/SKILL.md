@@ -136,3 +136,10 @@ Jest rarely renders at a font scale, so the screenshot is the test.
 These faults travel with the template an app was cut from: three sibling apps
 had the same `childAspectRatio: 1.15` badge grid, and two ignored Reduce
 Motion. Fix the template too, or it comes back with the next app.
+
+**A finishing fix must not land on a sibling's chrome.** The quick cure for a
+screen that looks unfinished is often the template's own shape: a stock title
+bar, a column of rounded rows, a grid of number tiles. On an account with
+sibling apps every one of them already has it, and guideline 4.3 reads shared
+screen shapes as one app in two colours. Make the fix in the app's own visual
+language, then run app-similarity's screens sheet and read it.

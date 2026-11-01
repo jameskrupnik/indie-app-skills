@@ -13,7 +13,7 @@ seemed obviously true.
 
 | Skill | What it does | Script |
 |---|---|---|
-| `app-similarity` | Measures how much a Flutter, React Native or Expo app shares with its sibling apps (of either stack) across source, store metadata, screenshots and bundled assets, before Apple's guideline 4.3 (spam) does. | `check_similarity.py` |
+| `app-similarity` | Measures how much a Flutter, React Native or Expo app shares with its sibling apps (of either stack) across source, store metadata, screenshots, bundled assets and how its icon and splash look, plus a contact sheet of its screens next to its siblings' to read for shared layouts, before Apple's guideline 4.3 (spam) does. | `check_similarity.py`, `screens_sheet.py` |
 | `listing-accuracy` | Checks that the store listing (fastlane, or Expo's `store.config.json`) and App Review notes describe the Flutter, React Native or Expo app that actually exists (guideline 2.3). | `check_listing.py` |
 | `play-release` | Gets a Flutter, React Native or Expo app onto Google Play: the order the declarations must be done in, a preflight of the signed `.aab` and store listing, the EEA consent gap, and which steps a human has to do. | `preflight.sh`, `handoff.sh` |
 | `perf` | Finds work repeated every frame in `render`, `paint` and `update` methods, and benchmarks a fix without being fooled by thermal throttling. | `check_perf.py`, `paired_bench.py`, `frame_probe.dart` |

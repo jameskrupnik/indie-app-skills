@@ -1,6 +1,6 @@
 ---
 name: app-similarity
-description: Measure how much a Flutter, React Native or Expo app shares with its sibling apps (source, store listing text, screenshots and bundled assets like audio, fonts and icons) before submitting it to the App Store or Google Play. Use when about to submit, resubmit or fork an app that shares a template or code with other apps on the same developer account; when a rejection mentions guideline 4.3, 4.3(a), "spam", "similar binary", "repackaged template", "same source code or assets" or "minimum functionality"; or when asked how similar two apps are, whether an app is too close to another, or to check similarity, overlap or duplication across several apps.
+description: Measure how much a Flutter, React Native or Expo app shares with its sibling apps (source, store listing text, screenshots, bundled assets like audio, fonts and icons, and the shapes of its screens: the same menu, title bar, list and stats layouts in a new colour) before submitting it to the App Store or Google Play. Use when about to submit, resubmit or fork an app that shares a template or code with other apps on the same developer account; when a rejection mentions guideline 4.3, 4.3(a), "spam", "similar binary", "repackaged template", "same source code or assets" or "minimum functionality"; or when asked how similar two apps are, whether an app is too close to another, whether its screens or interface look like a sibling's, or to check similarity, overlap or duplication across several apps.
 ---
 
 # App similarity check
@@ -9,8 +9,11 @@ One developer account shipping several apps cut from the same template runs
 into Apple's guideline 4.3(a): apps that share "the same source code or
 assets" with others already submitted and differ only in minor ways get
 rejected, and repeated rejections escalate to the whole account. **The number
-is invisible without measuring it** — apps that get rejected this way usually
-look completely different on screen.
+is invisible without measuring it** — apps that get rejected this way often
+look different on screen. And the reverse is just as real: an app can differ
+on every file and still **look** like its sibling, because its screens have
+the same shapes. Both halves are below: the measured surfaces, then the
+screens sheet, which is read by eye.
 
 ## Quick start
 
@@ -22,7 +25,9 @@ Run it from the app you are about to submit. Siblings are every directory next
 to it that has a `pubspec.yaml` or a `package.json` naming `react-native`,
 whatever the app's own stack: a reviewer compares listings and assets, not
 frameworks, so a React Native port of a Flutter app is measured against it.
-Standard library only, Python 3.9+.
+Standard library only, Python 3.9+, except the `look` surface and
+`screens_sheet.py`, which need Pillow (`python3 -m pip install Pillow`);
+without it `look` is reported unmeasured.
 
 **Exit codes:** `0` clear; `1` any surface at or above the threshold (default
 **30%**), or any metadata, screenshot or asset file byte-identical to a
@@ -71,7 +76,7 @@ siblings.
   (Flutter) or `ios/<App>/*.xcassets` (React Native). A managed Expo app with
   no `ios/`/`android/` is measured on `assets/` alone.
 
-## The four surfaces, and why there are four
+## The five surfaces, and why there are five
 
 4.3(a)'s wording is "the same source code **or assets**" and "a similar
 binary, **metadata**, and/or **concept**", so a clean source number proves
@@ -91,6 +96,32 @@ nothing on its own.
   effects, fonts, and the generated icon and launch images on both platforms.
   Byte-identical, on content, for the same reason — **and this is the surface
   where renaming is the norm, not the exception.**
+
+- **look** — the app icon, the launch image and the in-app splash
+  (`assets/splash/splash.png`), compared by **how they look**, not by bytes.
+  Each is cropped to its subject (what differs from the background, or the
+  opaque part of a transparent image), stretched to 64x64, and scored two
+  ways: **shape**, a 128-bit gradient hash (rows and columns), and
+  **palette**, the overlap of 512-bin colour histograms. Icons are compared
+  with the sibling's icon *and* splash, since a fork's splash is often its
+  parent's icon. Needs Pillow; without it the surface is reported unmeasured.
+
+Why look matters: a redrawn icon is a new file to sha256 and the same picture
+to a reviewer scrolling the developer's other apps. A 4.3(a) rejection can
+land on an app whose files are all new but whose icon is its sibling's,
+redrawn.
+
+**Look-alike rule:** shape ≥ 0.90 on its own, or shape ≥ 0.75 with palette ≥
+0.40 (`LOOK_*` constants). Calibrated on ~190 images from ~115 apps (about
+17,000 pairs): unrelated pairs sit at a median shape of 0.52, p99 0.81. It
+flags two client-demo apps with the same letter icon (0.95) and two
+coin-on-navy icons (0.77 shape, 0.56 palette), which a person also reads as
+one family. The next pair down is 0.72/0.20. Two traps
+found while calibrating: padding a tall splash to a square gave every splash
+the same grey bars, which matched (now stretched instead), and at 64 colour
+bins dark teal and dark navy were one colour (now 512). Re-calibrate before
+moving a threshold: a shape-only match below 0.9 came from round badges in
+unrelated colours (0.80, palette 0).
 
 Why assets matter: a forked sound generator produces the same bytes in every
 repo, so one `.wav` can ship in five apps under five names (`level_up`,
@@ -131,6 +162,16 @@ Excluding the wrong thing hides a real finding; excluding nothing buries it.
   splash tools write them, so they are identical because the *tools* are.
   Three entries that always mean nothing are how the one that means something
   gets skimmed past.
+- **assets**: any **1x1 PNG**. `flutter_native_splash` writes a 69-byte
+  transparent pixel as `LaunchImage*.png` whenever the splash is a
+  full-screen background with no centre image, so nine apps read as
+  byte-identical over an image nobody can see. Only an exact 1x1 is dropped.
+- **assets**: published third-party fonts, by **SHA-256** in
+  `THIRD_PARTY_ASSET_SHA256` (Google's Roboto, embedded for PDF export).
+  Identical because the app needs that exact file, as with a pub package.
+  Matched on bytes, not names: a custom font renamed `Roboto-*.ttf` is still
+  compared. Add a hash only for an unmodified upstream release, with its
+  source and licence in the comment.
 
 `--ignore` exists for the same reason, but everything it drops is listed in
 the report. Use it for things that are genuinely not yours to vary, such as an
@@ -161,6 +202,38 @@ under a heading that is supposed to mean "somebody copied something". There is
 no job two apps share that requires the same store text, screenshot or sound
 effect.
 
+## Screens: the shape check, read by eye
+
+The surfaces above compare files. None of them can say that two apps open on
+the same *screen shape*: one wide accent button over a grid of nav tiles, a
+back-arrow title bar on every inner screen, a column of rounded coloured rows,
+a grid of number-over-label tiles. A reviewer scrolling the developer's other
+apps sees those first, and a new palette does not hide them. Measured on a
+real app: its source, listing, icon, palette and art were all its
+own, and four screen shapes were still shared with three siblings.
+
+```bash
+python3 ${CLAUDE_SKILL_DIR}/screens_sheet.py \
+    [--exclude GLOB ...] [--sibling NAME ...] [--rows 8]
+```
+
+It finds each app's screens (raw captures under `build/screenshots/raw`
+first, then store images), ranks siblings by a layout hash, and draws
+`build/similarity/screens.png`: this app on the top row, the closest siblings
+under it. **Pass `--sibling` for the fork parent and every app cut from the
+same template**: the hash ranks on light and dark more than on shape, so the
+sibling that matters may not be in the top rows.
+
+**Then read the sheet** against
+[references/screen-shapes.md](references/screen-shapes.md), which lists the
+shapes that give a template away and what counts as a fix. The script never
+fails a run: its ranking is uncalibrated and points at where to look. A
+sibling with no screens to find is printed as UNMEASURED, not clear.
+
+**The fix is a redesign, not a recolour**: replace the shared shape with an
+object from the app's own world, keep the interaction conventional. Record the
+layout idea in the app's CLAUDE.md so the next fork picks a different one.
+
 ## The metric's blind spots — read before trusting a movement
 
 **1. Source and metadata are matched by relative path.** A file whose path has
@@ -182,8 +255,8 @@ count, so A→B and B→A differ when the apps differ in size (one pair measured
 *live* sibling is over the line, run it from there too.
 
 **4. It cannot see concept.** Two apps with no shared file can still be the
-same app to a reviewer. Nothing here measures that; see the account check
-below.
+same app to a reviewer. The screens sheet above is the nearest thing, and it is
+read, not measured; see also the account check below.
 
 ## What counts as a fix, and what does not
 

@@ -13,11 +13,14 @@ description, screenshot or sound effect.
                Metadata store.config.json, matched by relative path
   screenshots  fastlane store images, byte-identical, matched on content
   assets       bundled audio/fonts/images/icons, byte-identical, on content
+  look         app icon, launch image and in-app splash, by how they look
+               (shape hash + palette), so a redrawn look-alike still shows;
+               needs Pillow, reported unmeasured without it
 
 Siblings are the directories next to the app (or under --root) that contain a
 pubspec.yaml or a package.json naming react-native, whichever stack the app
 itself is: a store reviewer compares listings and assets, not frameworks.
-Standard library only; Python 3.9+.
+Standard library only, except Pillow for `look`; Python 3.9+.
 
 Exit codes: 0 all clear, 1 over threshold or a byte-identical file on a
 non-source surface, 2 usage error (bad path, no siblings).
@@ -35,7 +38,12 @@ import pathlib
 import re
 import sys
 
-SURFACES = ('source', 'metadata', 'screenshots', 'assets')
+try:  # Optional: only the `look` surface needs it, and it says so when missing.
+    from PIL import Image, ImageChops
+except ImportError:
+    Image = ImageChops = None
+
+SURFACES = ('source', 'metadata', 'screenshots', 'assets', 'look')
 
 # Pruned everywhere. Walking into build/ or .dart_tool/ costs minutes on a
 # built app (gigabytes of output) and never holds anything worth comparing.
@@ -85,6 +93,54 @@ RN_PLATFORM_ASSET_GLOBS = ('ios/*/*.xcassets', 'android/app/src/main/res')
 # they are identical across apps because the tools are. Same for fastlane's
 # Framefile.json, which is not a .txt and so never reaches the metadata set.
 ASSET_EXCLUDE_NAME = {'contents.json'}
+
+
+# Published third-party files, by SHA-256, that an app bundles unmodified
+# because it needs *that* file: the same reason two apps share a pub package.
+# Keyed by exact bytes, not by name, so a custom font renamed `Roboto-*.ttf`
+# is still compared, and a different Roboto release shows up until added here.
+THIRD_PARTY_ASSET_SHA256 = {
+    # Google's Roboto (Apache 2.0), as shipped in Flutter's font cache. Apps
+    # embed it for PDF export: `pdf`'s Helvetica lacks common glyphs.
+    '79e851404657dac2106b3d22ad256d47824a9a5765458edb72c9102a45816d95': 'Roboto-Regular',
+    '7d0b991ee3e0be7af01ad7ea8cd2beea6c00a25e679a0226b6737f079aafff86': 'Roboto-Bold',
+    # SIL's Andika (OFL 1.1), byte-for-byte google/fonts ofl/andika/. A
+    # beginning-reader face; kids' apps that use it need that exact file, as
+    # with a pub package.
+    '202b96b1f174a4a43baefe885b40dacacb81786755efd08ed4b7704e79c45515': 'Andika-Regular',
+    '4361126189a2d0e0da66999352db58aaf1b4ca940faf8a8239d725f8303d890d': 'Andika-Bold',
+}
+
+
+def _is_third_party(f: pathlib.Path) -> bool:
+    if not f.name.lower().endswith(('.ttf', '.otf')):
+        return False
+    try:
+        return hashlib.sha256(f.read_bytes()).hexdigest() in THIRD_PARTY_ASSET_SHA256
+    except OSError:
+        return False
+
+
+def _is_placeholder_pixel(f: pathlib.Path) -> bool:
+    """True for a 1x1 PNG: a generator's stand-in, not a picture.
+
+    `flutter_native_splash` writes a 69-byte transparent pixel as
+    `LaunchImage*.png` whenever the splash is a full-screen background image
+    with no centre image, so every app configured that way ships the same
+    bytes because the *tool* does, as with `Contents.json`. It flagged nine
+    apps as byte-identical over an image nobody can see. Only an exact 1x1 is
+    excluded; any real icon or splash is far larger and is still compared.
+    """
+    if f.suffix.lower() != '.png':
+        return False
+    try:
+        with f.open('rb') as fh:
+            head = fh.read(24)
+    except OSError:
+        return False
+    if len(head) < 24 or head[:8] != b'\x89PNG\r\n\x1a\n' or head[12:16] != b'IHDR':
+        return False
+    return int.from_bytes(head[16:20], 'big') == 1 and int.from_bytes(head[20:24], 'big') == 1
 
 
 def is_rn(app: pathlib.Path) -> bool:
@@ -258,12 +314,166 @@ def asset_files(app, cfg) -> dict[str, pathlib.Path]:
             tops.append(pathlib.Path(dirpath))
             dirnames[:] = []
     files = (f for t in tops for f in _walk(t, ASSET_SUFFIXES)
-             if f.name.lower() not in ASSET_EXCLUDE_NAME)
+             if f.name.lower() not in ASSET_EXCLUDE_NAME
+             and not _is_placeholder_pixel(f) and not _is_third_party(f))
     return _rel(app, files, cfg.ignore)
 
 
+def _look_candidates(app: pathlib.Path) -> dict[str, list[pathlib.Path]]:
+    """Where each picture a reviewer sees first lives, most preferred first."""
+    if is_rn(app):
+        icon = sorted(app.glob('ios/*/Images.xcassets/AppIcon.appiconset/*.png'))
+        launch = sorted(app.glob('ios/*/Images.xcassets/SplashScreen*.imageset/*.png'))
+    else:
+        icon = sorted(app.glob('ios/Runner/Assets.xcassets/AppIcon.appiconset/*.png'))
+        launch = sorted(app.glob('ios/Runner/Assets.xcassets/LaunchImage.imageset/*.png'))
+    icon = icon or sorted(app.glob('android/app/src/main/res/mipmap-*/ic_launcher.png'))
+    launch = launch or sorted(app.glob('android/app/src/main/res/drawable*/splash.png'))
+    in_app = [p for p in (app / 'assets/splash/splash.png',) if p.exists()]
+    return {'icon': icon, 'launch image': launch, 'in-app splash': in_app}
+
+
+def look_files(app, cfg) -> dict[str, pathlib.Path]:
+    """The app icon and the splash images, keyed by role, largest file each.
+
+    Compared by how they look, not by bytes: a redrawn icon with the same
+    window, the same palette and the same composition is a new file to
+    sha256 and the same picture to a reviewer scrolling the developer's apps.
+    """
+    if Image is None:
+        return {}
+    out = {}
+    for role, files in _look_candidates(app).items():
+        best, area = None, 1
+        for f in files:
+            if any(fnmatch.fnmatch(f.relative_to(app).as_posix(), g)
+                   for g in cfg.ignore):
+                continue
+            try:
+                with Image.open(f) as im:
+                    a = im.size[0] * im.size[1]
+            except OSError:
+                continue
+            if a > area:            # skips the generator's 1x1 placeholder
+                best, area = f, a
+        if best is not None:
+            out[role] = best
+    return out
+
+
+def _subject(path: pathlib.Path):
+    """The picture's subject on a neutral ground, stretched to 64x64.
+
+    A splash is mostly flat background, and a flat area hashes the same in
+    every app, so two unrelated splash logos would read as alike. Cropping to
+    what differs from the background compares the logos themselves.
+    """
+    im = Image.open(path).convert('RGBA')
+    alpha = im.getchannel('A')
+    if alpha.getextrema()[0] < 250:                      # has transparency
+        box = alpha.point(lambda v: 255 if v > 16 else 0).getbbox()
+        ground = Image.new('RGBA', im.size, (128, 128, 128, 255))
+        im = Image.alpha_composite(ground, im)
+    else:
+        rgb = im.convert('RGB')
+        bg = Image.new('RGB', im.size, rgb.getpixel((0, 0)))
+        diff = ImageChops.difference(rgb, bg).convert('L')
+        box = diff.point(lambda v: 255 if v > 24 else 0).getbbox()
+    im = im.convert('RGB')
+    if box and (box[2] - box[0]) * (box[3] - box[1]) > im.size[0] * im.size[1] * 0.02:
+        im = im.crop(box)
+    # Stretched, not padded: padding a tall phone splash to a square adds two
+    # identical grey bars to every one, and the bars alone read as a match.
+    return im.resize((64, 64), Image.LANCZOS)
+
+
+def _pixels(im) -> list:
+    """Pillow 12 deprecates getdata(); its replacement is new in 12."""
+    get = getattr(im, 'get_flattened_data', None) or im.getdata
+    return list(get())
+
+
+def _dhash(im) -> int:
+    """128-bit gradient hash, rows and columns: the picture's shape."""
+    g = im.convert('L')
+    h = _pixels(g.resize((9, 8), Image.LANCZOS))
+    v = _pixels(g.resize((8, 9), Image.LANCZOS))
+    bits = 0
+    for y in range(8):
+        for x in range(8):
+            bits = (bits << 1) | (h[y * 9 + x] > h[y * 9 + x + 1])
+            bits = (bits << 1) | (v[y * 8 + x] > v[(y + 1) * 8 + x])
+    return bits
+
+
+def _palette(im) -> list[float]:
+    """Share of pixels in each of 512 colour bins: the picture's palette.
+
+    Eight levels a channel, not four: at four, dark teal and dark navy fall in
+    the same bin and two unrelated dark splashes read as one palette.
+    """
+    counts = [0] * 512
+    for r, g, b in _pixels(im.resize((32, 32), Image.LANCZOS)):
+        counts[(r >> 5) * 64 + (g >> 5) * 8 + (b >> 5)] += 1
+    return [c / 1024 for c in counts]
+
+
+def look_signature(path: pathlib.Path):
+    im = _subject(path)
+    return _dhash(im), _palette(im)
+
+
+def look_similarity(a, b) -> tuple[float, float]:
+    """(shape, palette), each 0-1. Unrelated pictures sit near 0.5 on shape."""
+    shape = 1 - bin(a[0] ^ b[0]).count('1') / 128
+    palette = sum(min(x, y) for x, y in zip(a[1], b[1]))
+    return shape, palette
+
+
+def look_alike(shape: float, palette: float) -> bool:
+    """Thresholds calibrated on ~190 images from ~115 apps: see SKILL.md."""
+    return shape >= LOOK_SHAPE or (shape >= LOOK_SHAPE_WITH_PALETTE
+                                   and palette >= LOOK_PALETTE)
+
+
+LOOK_SHAPE = 0.9
+LOOK_SHAPE_WITH_PALETTE = 0.75
+LOOK_PALETTE = 0.4
+
+
+def compare_look(mine, theirs) -> list[dict]:
+    """Same role (icon to icon, splash to splash) and across roles, since a
+    fork's splash is often its parent's icon."""
+    sigs = {}
+
+    def sig(p):
+        if p not in sigs:
+            try:
+                sigs[p] = look_signature(p)
+            except OSError:
+                sigs[p] = None
+        return sigs[p]
+
+    out = []
+    for role, path in mine.items():
+        best = None
+        for their_role, their_path in theirs.items():
+            a, b = sig(path), sig(their_path)
+            if a is None or b is None:
+                continue
+            shape, palette = look_similarity(a, b)
+            if look_alike(shape, palette) and (best is None or shape > best['shape']):
+                best = {'file': role, 'twin': their_role, 'lines': 0,
+                        'shape': round(shape, 2), 'palette': round(palette, 2),
+                        'ratio': 1.0 if a == b else min(round(shape, 3), 0.999)}
+        if best:
+            out.append(best)
+    return out
+
+
 COLLECTORS = {'source': dart_files, 'metadata': meta_files,
-              'screenshots': image_files, 'assets': asset_files}
+              'screenshots': image_files, 'assets': asset_files,
+              'look': look_files}
 
 
 def rn_names(app: pathlib.Path) -> set[str]:
@@ -413,6 +623,8 @@ def compare(app, other, cfg, mine_files):
         mine, theirs = mine_files[s], COLLECTORS[s](other, cfg)
         if s in ('source', 'metadata'):
             shared = compare_text(mine, theirs, norm, cfg.near)
+        elif s == 'look':
+            shared = compare_look(mine, theirs)
         else:
             shared = compare_bytes(mine, theirs)
         out['surfaces'][s] = {
@@ -427,8 +639,36 @@ def compare(app, other, cfg, mine_files):
     return out
 
 
+def git_repo_of(d: pathlib.Path) -> pathlib.Path | None:
+    """The repository a checkout belongs to, shared by all its worktrees.
+
+    A worktree's `.git` is a file reading `gitdir: <repo>/.git/worktrees/<n>`;
+    the main checkout's is the `.git` directory itself.
+    """
+    g = d / '.git'
+    if g.is_dir():
+        return g.resolve()
+    if g.is_file():
+        line = g.read_text(errors='replace').strip()
+        if line.startswith('gitdir:'):
+            p = pathlib.Path(line[len('gitdir:'):].strip())
+            p = (d / p).resolve() if not p.is_absolute() else p.resolve()
+            if p.parent.name == 'worktrees':
+                return p.parent.parent
+            return p
+    return None
+
+
 def find_siblings(app, root, only, exclude):
-    out = []
+    """Sibling apps under root, one per repository.
+
+    A git worktree is a second checkout of one app, not a sibling: comparing
+    against it reports the app as a copy of itself. Worktrees of the app's own
+    repo are skipped, and another repo's worktrees collapse to its main
+    checkout (or its first worktree when the main one is not under root).
+    """
+    mine = git_repo_of(app)
+    out, seen = [], {}
     for d in sorted(root.iterdir()):
         if not d.is_dir() or d.resolve() == app:
             continue
@@ -438,6 +678,15 @@ def find_siblings(app, root, only, exclude):
             continue
         if any(fnmatch.fnmatch(d.name, g) for g in exclude):
             continue
+        repo = git_repo_of(d)
+        if repo is not None and not only:
+            if repo == mine:
+                continue
+            if repo in seen:
+                if (d / '.git').is_dir():
+                    out[seen[repo]] = d.resolve()
+                continue
+            seen[repo] = len(out)
         out.append(d.resolve())
     return out
 
@@ -445,7 +694,7 @@ def find_siblings(app, root, only, exclude):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__.split('\n\n')[0] + ' Reports four surfaces '
-        '(source, metadata, screenshots, assets) against every sibling app, '
+        '(source, metadata, screenshots, assets, look) against every sibling app, '
         'for App Store guideline 4.3(a) "spam" checks.',
         epilog='Always pass --alias for the domain nouns of both apps (the '
         'taco, the fruit): without them, files identical except for those '
@@ -465,7 +714,7 @@ def parse_args(argv=None):
                     help='domain word to normalise away in text, e.g. '
                     '--alias candy; repeatable')
     ap.add_argument('--surface', action='append', default=[], choices=SURFACES,
-                    help='limit to a surface; repeatable (default: all four)')
+                    help='limit to a surface; repeatable (default: all five)')
     ap.add_argument('--threshold', type=int, default=30, metavar='N',
                     help='fail when any surface is at or above N%% (default 30)')
     ap.add_argument('--near', type=float, default=0.9, metavar='R',
@@ -574,14 +823,18 @@ def main(argv=None) -> int:
         print(f'\n=== {s.upper()} — {len(mine_files[s])} files ===')
         if not mine_files[s]:
             # Not a pass: a silent 0% reads as "checked and clean".
-            print('  NOTHING TO COMPARE — this app has no files on this '
-                  'surface, so it is\n  unmeasured, not clean.')
+            if s == 'look' and Image is None:
+                print('  NOT MEASURED — needs Pillow (pip install Pillow).')
+            else:
+                print('  NOTHING TO COMPARE — this app has no files on this '
+                      'surface, so it is\n  unmeasured, not clean.')
             continue
         rows = [r for r in sorted(results,
                                   key=lambda r: -r['surfaces'][s]['percent'])
                 if r['surfaces'][s]['shared_files']]
         if not rows:
-            print('  no sibling shares a file on this surface')
+            print('  no sibling looks alike' if s == 'look' else
+                  '  no sibling shares a file on this surface')
             continue
         for r in rows:
             rs = r['surfaces'][s]
@@ -602,7 +855,11 @@ def main(argv=None) -> int:
 
         print(f'\n  largest shared with {sib}:')
         for x in w['files'][:args.top]:
-            if 'twin' in x:
+            if 'shape' in x:
+                print(f'        -  {x["file"]}  looks like  {sib}\'s {x["twin"]}'
+                      f'  (shape {int(x["shape"] * 100)}%, palette '
+                      f'{int(x["palette"] * 100)}%)')
+            elif 'twin' in x:
                 print(f'        -  {x["file"]}  ==  {x["twin"]}')
             else:
                 kind = ('identical' if x['ratio'] == 1.0

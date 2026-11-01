@@ -1,6 +1,6 @@
 {
   "name": "indie-app-skills",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Claude Code skills for shipping small Flutter, React Native and Expo apps: store-rejection checks, Google Play releases, performance, polish, niche research, writing that reads as human, and keeping CLAUDE.md under its size limit.",
   "author": {
     "name": "James Krupnik",
